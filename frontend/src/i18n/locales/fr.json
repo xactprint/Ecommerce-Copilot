@@ -1,0 +1,14 @@
+{
+  "appName": "AI E-commerce Copilot",
+  "dashboard": "Tableau de bord",
+  "products": "Produits",
+  "orders": "Commandes",
+  "advertising": "Publicité",
+  "profit": "Bénéfice net",
+  "sales": "Ventes",
+  "adSpend": "Dépenses publicitaires",
+  "deliveryCosts": "Coûts de livraison",
+  "welcome": "Bienvenue dans AI E-commerce Copilot",
+  "demoNotice": "Ces chiffres sont des exemples, pas des données réelles",
+  "language": "Langue"
+}
