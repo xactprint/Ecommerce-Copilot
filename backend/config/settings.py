@@ -10,22 +10,77 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.utils import get_random_secret_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def _load_dotenv_file(path: Path) -> None:
+    """Charge un fichier .env local (KEY=VALUE) sans dépendance externe.
+
+    Les variables déjà présentes dans l'environnement du processus ont la
+    priorité. Ce mini-chargeur évite d'ajouter python-dotenv au projet.
+    """
+    if not path.is_file():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_list(name: str, default) -> list:
+    raw = os.environ.get(name, "")
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    return items if items else list(default)
+
+
+# Charge un éventuel fichier backend/.env (non suivi par Git).
+_load_dotenv_file(BASE_DIR / ".env")
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-2%^mq2yv1v(5w8zl*r^xn3pqkagbg!!!*1&cg*ffz5!2@n-s1%'
-
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = _env_bool("DJANGO_DEBUG", True)
 
-ALLOWED_HOSTS = []
+# SECURITY WARNING: keep the secret key used in production secret!
+# En développement, une clé éphémère est générée si aucune variable n'est fournie.
+# En production (DJANGO_DEBUG=false), DJANGO_SECRET_KEY est obligatoire.
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = get_random_secret_key()
+    else:
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY doit être défini lorsque DJANGO_DEBUG=false."
+        )
+
+# Hôtes autorisés, séparés par des virgules.
+ALLOWED_HOSTS = _env_list("DJANGO_ALLOWED_HOSTS", [])
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured(
+        "DJANGO_ALLOWED_HOSTS doit être défini lorsque DJANGO_DEBUG=false."
+    )
 
 
 # Application definition
@@ -38,6 +93,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework.authtoken',
     'corsheaders',
     'api',
 ]
@@ -126,11 +182,40 @@ STATIC_URL = 'static/'
 
 MAILERS = {
     'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        'BACKEND': os.environ.get(
+            'DJANGO_EMAIL_BACKEND',
+            'django.core.mail.backends.console.EmailBackend',
+        ),
     },
 }
 
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-]
+# CORS — origines autorisées, séparées par des virgules.
+CORS_ALLOWED_ORIGINS = _env_list(
+    "DJANGO_CORS_ALLOWED_ORIGINS",
+    ["http://localhost:5173"],
+)
+
+
+# Django REST Framework — configuration explicite (aucune dépendance aux défauts).
+# Authentification par jeton + accès strictement réservé aux utilisateurs connectés.
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 50,
+}
+
+
+# Réglages de sécurité appliqués uniquement hors développement.
+# L'environnement localhost (DEBUG=true) n'est volontairement pas contraint à HTTPS.
+if not DEBUG:
+    SECURE_SSL_REDIRECT = _env_bool("DJANGO_SECURE_SSL_REDIRECT", True)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True

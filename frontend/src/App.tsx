@@ -1,5 +1,6 @@
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import type { FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   LayoutDashboard,
@@ -16,6 +17,8 @@ import {
   RefreshCw,
   Boxes,
   ClipboardList,
+  LogIn,
+  LogOut,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -75,6 +78,66 @@ type Page = 'dashboard' | 'products' | 'orders'
 
 const API_URL = 'http://127.0.0.1:8000/api'
 
+const TOKEN_STORAGE_KEY = 'ec_copilot_token'
+
+class UnauthorizedError extends Error {
+  constructor() {
+    super('Unauthorized')
+    this.name = 'UnauthorizedError'
+  }
+}
+
+const getStoredToken = () => sessionStorage.getItem(TOKEN_STORAGE_KEY)
+
+const authHeaders = (token: string) => ({ Authorization: `Token ${token}` })
+
+async function fetchJson<T>(
+  path: string,
+  token: string,
+  signal: AbortSignal,
+): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, {
+    headers: authHeaders(token),
+    signal,
+  })
+
+  if (response.status === 401) throw new UnauthorizedError()
+  if (!response.ok) throw new Error(`API error ${response.status}`)
+
+  return (await response.json()) as T
+}
+
+async function fetchAllPages<T>(
+  path: string,
+  token: string,
+  signal: AbortSignal,
+): Promise<T[]> {
+  const items: T[] = []
+  let nextUrl: string | null = `${API_URL}${path}`
+
+  while (nextUrl) {
+    const response = await fetch(nextUrl, {
+      headers: authHeaders(token),
+      signal,
+    })
+
+    if (response.status === 401) throw new UnauthorizedError()
+    if (!response.ok) throw new Error(`API error ${response.status}`)
+
+    const data = await response.json()
+
+    if (Array.isArray(data)) {
+      items.push(...(data as T[]))
+      nextUrl = null
+    } else {
+      items.push(...((data.results ?? []) as T[]))
+      nextUrl = typeof data.next === 'string' ? data.next : null
+    }
+  }
+
+  return items
+}
+
 const salesData = [
   { day: '01', sales: 18000 },
   { day: '05', sales: 26000 },
@@ -104,35 +167,102 @@ function App() {
   const [currentPage, setCurrentPage] = useState<Page>('dashboard')
   const [refreshKey, setRefreshKey] = useState(0)
 
+  const [token, setToken] = useState<string | null>(() => getStoredToken())
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [loginError, setLoginError] = useState<string | null>(null)
+  const [loginLoading, setLoginLoading] = useState(false)
+
   const language = i18n.resolvedLanguage === 'fr' ? 'fr' : 'ar'
   const isArabic = language === 'ar'
+
+  const clearSession = useCallback(() => {
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY)
+    setToken(null)
+    setDashboard(null)
+    setProducts([])
+    setOrders([])
+  }, [])
+
+  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setLoginLoading(true)
+    setLoginError(null)
+
+    try {
+      const response = await fetch(`${API_URL}/token/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      })
+
+      if (!response.ok) {
+        setLoginError(
+          isArabic
+            ? 'فشل تسجيل الدخول. تحقق من بيانات الاعتماد.'
+            : 'Échec de la connexion. Vérifiez vos identifiants.',
+        )
+        return
+      }
+
+      const data = await response.json()
+
+      if (typeof data.token !== 'string' || !data.token) {
+        setLoginError(
+          isArabic
+            ? 'رد غير متوقع من الخادم.'
+            : 'Réponse inattendue du serveur.',
+        )
+        return
+      }
+
+      sessionStorage.setItem(TOKEN_STORAGE_KEY, data.token)
+      setToken(data.token)
+    } catch {
+      setLoginError(
+        isArabic
+          ? 'تعذر الاتصال بالخادم. تأكد من تشغيل Django.'
+          : 'Impossible de contacter le serveur. Vérifiez que Django est démarré.',
+      )
+    } finally {
+      setPassword('')
+      setLoginLoading(false)
+    }
+  }
+
+  const handleLogout = () => {
+    clearSession()
+  }
 
   useEffect(() => {
     document.documentElement.lang = language
     document.documentElement.dir = isArabic ? 'rtl' : 'ltr'
   }, [language, isArabic])
 
-  // Charger le dashboard depuis Django
+  // Charger le dashboard depuis Django (authentifié)
   useEffect(() => {
+    if (!token) return
+
+    const currentToken = token
     const controller = new AbortController()
 
     async function fetchDashboard() {
       try {
         setDashboardLoading(true)
 
-        const response = await fetch(`${API_URL}/dashboard/`, {
-          signal: controller.signal,
-        })
-
-        if (!response.ok) {
-          throw new Error('Dashboard API error')
-        }
-
-        const data: DashboardData = await response.json()
+        const data = await fetchJson<DashboardData>(
+          '/dashboard/',
+          currentToken,
+          controller.signal,
+        )
         setDashboard(data)
         setDashboardError(null)
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') return
+        if (error instanceof UnauthorizedError) {
+          clearSession()
+          return
+        }
 
         setDashboardError(
           isArabic
@@ -149,11 +279,11 @@ function App() {
     void fetchDashboard()
 
     return () => controller.abort()
-  }, [isArabic, refreshKey])
+  }, [isArabic, refreshKey, token, clearSession])
 
   // Charger les produits depuis Django
   useEffect(() => {
-    if (currentPage !== 'products') return
+    if (currentPage !== 'products' || !token) return
 
     const controller = new AbortController()
 
@@ -162,18 +292,18 @@ function App() {
         setProductsLoading(true)
         setProductsError(null)
 
-        const response = await fetch(`${API_URL}/products/`, {
-          signal: controller.signal,
-        })
-
-        if (!response.ok) {
-          throw new Error('Products API error')
-        }
-
-        const data = await response.json()
-        setProducts(Array.isArray(data) ? data : data.results ?? [])
+        const items = await fetchAllPages<Product>(
+          '/products/',
+          token as string,
+          controller.signal,
+        )
+        setProducts(items)
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') return
+        if (error instanceof UnauthorizedError) {
+          clearSession()
+          return
+        }
 
         setProductsError(
           isArabic
@@ -190,11 +320,11 @@ function App() {
     void fetchProducts()
 
     return () => controller.abort()
-  }, [currentPage, isArabic, refreshKey])
+  }, [currentPage, isArabic, refreshKey, token, clearSession])
 
   // Charger les commandes depuis Django
   useEffect(() => {
-    if (currentPage !== 'orders') return
+    if (currentPage !== 'orders' || !token) return
 
     const controller = new AbortController()
 
@@ -203,18 +333,18 @@ function App() {
         setOrdersLoading(true)
         setOrdersError(null)
 
-        const response = await fetch(`${API_URL}/orders/`, {
-          signal: controller.signal,
-        })
-
-        if (!response.ok) {
-          throw new Error('Orders API error')
-        }
-
-        const data = await response.json()
-        setOrders(Array.isArray(data) ? data : data.results ?? [])
+        const items = await fetchAllPages<Order>(
+          '/orders/',
+          token as string,
+          controller.signal,
+        )
+        setOrders(items)
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') return
+        if (error instanceof UnauthorizedError) {
+          clearSession()
+          return
+        }
 
         setOrdersError(
           isArabic
@@ -231,7 +361,7 @@ function App() {
     void fetchOrders()
 
     return () => controller.abort()
-  }, [currentPage, isArabic, refreshKey])
+  }, [currentPage, isArabic, refreshKey, token, clearSession])
 
   const changeLanguage = (nextLanguage: 'ar' | 'fr') => {
     void i18n.changeLanguage(nextLanguage)
@@ -315,6 +445,107 @@ function App() {
   const totalCosts = dashboard
     ? dashboard.adSpend + dashboard.deliveryCosts
     : 0
+
+  if (!token) {
+    return (
+      <div className="login-shell" dir={isArabic ? 'rtl' : 'ltr'}>
+        <div
+          className="language-switch login-language"
+          aria-label={t('language')}
+        >
+          <Languages size={17} />
+
+          <button
+            className={language === 'ar' ? 'selected' : ''}
+            onClick={() => changeLanguage('ar')}
+            type="button"
+            aria-pressed={language === 'ar'}
+          >
+            العربية
+          </button>
+
+          <span className="language-divider">|</span>
+
+          <button
+            className={language === 'fr' ? 'selected' : ''}
+            onClick={() => changeLanguage('fr')}
+            type="button"
+            aria-pressed={language === 'fr'}
+          >
+            FR
+          </button>
+        </div>
+
+        <div className="login-card">
+          <div className="brand login-brand">
+            <div className="brand-icon">
+              <TrendingUp size={23} />
+            </div>
+            <div className="brand-copy">
+              <strong>AI Copilot</strong>
+              <span>E-COMMERCE INTELLIGENCE</span>
+            </div>
+          </div>
+
+          <h1>{isArabic ? 'تسجيل الدخول' : 'Connexion'}</h1>
+          <p className="login-subtitle">
+            {isArabic
+              ? 'سجّل الدخول للوصول إلى بيانات متجرك.'
+              : 'Connectez-vous pour accéder aux données de votre boutique.'}
+          </p>
+
+          <form className="login-form" onSubmit={handleLogin}>
+            <label htmlFor="login-username">
+              {isArabic ? 'اسم المستخدم' : "Nom d'utilisateur"}
+            </label>
+            <input
+              id="login-username"
+              type="text"
+              autoComplete="username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              required
+              disabled={loginLoading}
+            />
+
+            <label htmlFor="login-password">
+              {isArabic ? 'كلمة المرور' : 'Mot de passe'}
+            </label>
+            <input
+              id="login-password"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+              disabled={loginLoading}
+            />
+
+            {loginError && (
+              <p className="login-error" role="alert">
+                {loginError}
+              </p>
+            )}
+
+            <button
+              type="submit"
+              className="login-submit"
+              disabled={loginLoading}
+            >
+              <LogIn size={17} />
+              {loginLoading
+                ? isArabic
+                  ? 'جارٍ الاتصال...'
+                  : 'Connexion en cours...'
+                : isArabic
+                  ? 'تسجيل الدخول'
+                  : 'Se connecter'}
+            </button>
+          </form>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app-shell" dir={isArabic ? 'rtl' : 'ltr'}>
@@ -401,6 +632,15 @@ function App() {
               <span className="status-dot" />
               {isArabic ? 'وضع تجريبي' : 'Mode démo'}
             </span>
+
+            <button
+              type="button"
+              className="logout-button"
+              onClick={handleLogout}
+            >
+              <LogOut size={16} />
+              <span>{isArabic ? 'خروج' : 'Déconnexion'}</span>
+            </button>
 
             <div className="language-switch" aria-label={t('language')}>
               <Languages size={17} />

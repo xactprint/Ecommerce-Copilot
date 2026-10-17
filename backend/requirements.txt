@@ -1,0 +1,8 @@
+# Dépendances directes du backend (versions de l'environnement validé en local).
+# Python utilisé lors des vérifications : 3.14.5 (Django 6.1 requiert Python >= 3.12).
+Django==6.1.2
+djangorestframework==3.18.3
+django-cors-headers==4.9.0
+
+# Dépendances transitives tirées automatiquement par les paquets ci-dessus
+# (non épinglées volontairement) : asgiref, sqlparse, tzdata.

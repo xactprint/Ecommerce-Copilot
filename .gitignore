@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+.Python
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+ENV/
+backend/venv/
+
+# Django
+*.log
+local_settings.py
+staticfiles/
+media/
+
+# Base de données (SQLite et fichiers associés)
+db.sqlite3
+db.sqlite3-journal
+db.sqlite3-shm
+db.sqlite3-wal
+*.sqlite3
+
+# Variables d'environnement et secrets locaux
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Frontend (Node / Vite)
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Éditeurs / IDE
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+
+# Divers
+*.bak
+*.tmp
