@@ -138,6 +138,18 @@ async function fetchAllPages<T>(
   return items
 }
 
+async function revokeToken(token: string): Promise<void> {
+  try {
+    await fetch(`${API_URL}/logout/`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      keepalive: true,
+    })
+  } catch {
+    // La session locale est déjà fermée : un échec réseau ne doit rien changer.
+  }
+}
+
 const salesData = [
   { day: '01', sales: 18000 },
   { day: '05', sales: 26000 },
@@ -231,7 +243,11 @@ function App() {
   }
 
   const handleLogout = () => {
+    if (!token) return
+
+    const tokenToRevoke = token
     clearSession()
+    void revokeToken(tokenToRevoke)
   }
 
   useEffect(() => {

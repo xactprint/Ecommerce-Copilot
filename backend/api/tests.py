@@ -205,3 +205,75 @@ class PaginationTests(SecuredApiTestCase):
         self.assertIn("count", response.data)
         self.assertIn("results", response.data)
         self.assertEqual(response.data["count"], 1)
+
+
+class LogoutTests(SecuredApiTestCase):
+    """Révocation du jeton via POST /api/logout/."""
+
+    def setUp(self):
+        super().setUp()
+        self.other_user = User.objects.create_user(
+            username="autre-utilisateur",
+            password=PASSWORD,
+        )
+        self.other_token = Token.objects.create(user=self.other_user)
+
+    def test_authenticated_user_can_logout(self):
+        self.authenticate()
+        response = self.client.post(reverse("api-logout"))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_logout_deletes_the_current_token(self):
+        self.authenticate()
+        self.assertTrue(Token.objects.filter(key=self.token.key).exists())
+
+        self.client.post(reverse("api-logout"))
+
+        self.assertFalse(Token.objects.filter(key=self.token.key).exists())
+
+    def test_revoked_token_cannot_access_products(self):
+        self.authenticate()
+        self.client.post(reverse("api-logout"))
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.token.key}")
+        self.assertRefused(self.client.get(reverse("product-list")))
+
+    def test_anonymous_cannot_logout(self):
+        self.assertRefused(self.client.post(reverse("api-logout")))
+        self.assertTrue(Token.objects.filter(key=self.token.key).exists())
+
+    def test_invalid_token_cannot_logout(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token invalid-token-value")
+        self.assertRefused(self.client.post(reverse("api-logout")))
+
+    def test_logout_does_not_delete_other_users_token(self):
+        self.authenticate()
+        self.client.post(reverse("api-logout"))
+
+        self.assertTrue(Token.objects.filter(key=self.other_token.key).exists())
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.other_token.key}")
+        self.assertEqual(
+            self.client.get(reverse("product-list")).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_login_again_after_logout_returns_a_new_working_token(self):
+        self.authenticate()
+        self.client.post(reverse("api-logout"))
+
+        self.client.credentials()
+        response = self.client.post(
+            reverse("api-token-auth"),
+            {"username": self.user.username, "password": PASSWORD},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("token", response.data)
+        self.assertNotEqual(response.data["token"], self.token.key)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {response.data['token']}")
+        self.assertEqual(
+            self.client.get(reverse("product-list")).status_code,
+            status.HTTP_200_OK,
+        )
