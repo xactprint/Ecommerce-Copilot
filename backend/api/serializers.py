@@ -53,4 +53,12 @@ class OrderSerializer(serializers.ModelSerializer):
             "total_amount",
             "created_at",
         ]
+        # La quantité doit être strictement positive et les montants de la
+        # commande ne peuvent pas être négatifs. Les bornes max_digits /
+        # decimal_places restent dérivées du modèle (aucun calcul flottant).
+        extra_kwargs = {
+            "quantity": {"min_value": 1},
+            "unit_price": {"min_value": 0},
+            "delivery_cost": {"min_value": 0},
+        }
   

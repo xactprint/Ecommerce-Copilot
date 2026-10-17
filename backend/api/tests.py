@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
 from django.urls import reverse
 from rest_framework import status
@@ -449,3 +451,236 @@ class DashboardMetricsTests(SecuredApiTestCase):
             [metric["key"] for metric in data["unavailableMetrics"]],
             ["adSpend", "historicalUnitCosts"],
         )
+
+
+class OrderValidationTests(SecuredApiTestCase):
+    """Fiabilité de la gestion des commandes : validation et cohérence.
+
+    Fixture de base : produit (achat 1000, vente 1500, stock 0) et une
+    commande « CMD-TEST-1 » (quantité 2, prix unitaire 1500, en attente).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.authenticate()
+
+    def order_payload(self, **overrides):
+        payload = {
+            "order_number": "CMD-VALIDE-1",
+            "customer_name": "Client valide",
+            "customer_phone": "0555000000",
+            "product": self.product.id,
+            "quantity": 3,
+            "unit_price": "1500.00",
+            "delivery_cost": "250.00",
+        }
+        payload.update(overrides)
+        return payload
+
+    def create_order(self, **overrides):
+        return self.client.post(reverse("order-list"), self.order_payload(**overrides))
+
+    def assertRejected(self, response, field):
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+            msg=f"Statut inattendu : {response.status_code}",
+        )
+        self.assertIn(field, response.data)
+
+    # --- 1. création valide ---------------------------------------------
+    def test_valid_order_creation_succeeds(self):
+        response = self.create_order()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = Order.objects.get(order_number="CMD-VALIDE-1")
+        self.assertEqual(order.quantity, 3)
+        self.assertEqual(order.unit_price, Decimal("1500.00"))
+        self.assertEqual(order.delivery_cost, Decimal("250.00"))
+        self.assertEqual(order.status, Order.Status.PENDING)
+        self.assertEqual(response.data["total_amount"], "4500.00")
+        self.assertEqual(response.data["product_name"], self.product.name)
+
+    def test_creation_does_not_modify_stock(self):
+        before = self.product.stock_quantity
+
+        self.create_order()
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, before)
+
+    # --- 2. quantité ------------------------------------------------------
+    def test_zero_quantity_is_refused(self):
+        self.assertRejected(self.create_order(quantity=0), "quantity")
+        self.assertFalse(Order.objects.filter(order_number="CMD-VALIDE-1").exists())
+
+    def test_negative_quantity_is_refused(self):
+        self.assertRejected(self.create_order(quantity=-3), "quantity")
+
+    def test_non_integer_quantity_is_refused(self):
+        self.assertRejected(self.create_order(quantity="1.5"), "quantity")
+
+    def test_omitted_quantity_falls_back_to_model_default(self):
+        payload = self.order_payload()
+        payload.pop("quantity")
+
+        response = self.client.post(reverse("order-list"), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["quantity"], 1)
+
+    # --- 3. prix unitaire -------------------------------------------------
+    def test_negative_unit_price_is_refused(self):
+        self.assertRejected(self.create_order(unit_price="-10.00"), "unit_price")
+
+    def test_non_numeric_unit_price_is_refused(self):
+        self.assertRejected(self.create_order(unit_price="gratuit"), "unit_price")
+
+    def test_unit_price_with_three_decimals_is_refused(self):
+        self.assertRejected(self.create_order(unit_price="10.999"), "unit_price")
+
+    def test_missing_unit_price_is_refused(self):
+        payload = self.order_payload()
+        payload.pop("unit_price")
+
+        self.assertRejected(self.client.post(reverse("order-list"), payload), "unit_price")
+
+    def test_zero_unit_price_is_allowed(self):
+        response = self.create_order(unit_price="0.00")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["total_amount"], "0.00")
+
+    # --- 4. frais de livraison -------------------------------------------
+    def test_negative_delivery_cost_is_refused(self):
+        self.assertRejected(self.create_order(delivery_cost="-5.00"), "delivery_cost")
+
+    def test_missing_delivery_cost_falls_back_to_zero(self):
+        payload = self.order_payload()
+        payload.pop("delivery_cost")
+
+        response = self.client.post(reverse("order-list"), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["delivery_cost"], "0.00")
+
+    # --- 5. produit -------------------------------------------------------
+    def test_unknown_product_is_refused(self):
+        self.assertRejected(self.create_order(product=999999), "product")
+
+    def test_missing_product_is_refused(self):
+        payload = self.order_payload()
+        payload.pop("product")
+
+        self.assertRejected(self.client.post(reverse("order-list"), payload), "product")
+
+    # --- 6. statut --------------------------------------------------------
+    def test_unknown_status_is_refused(self):
+        self.assertRejected(self.create_order(status="inconnu"), "status")
+
+    def test_all_six_documented_statuses_are_accepted(self):
+        for index, (value, _) in enumerate(Order.Status.choices):
+            response = self.create_order(
+                order_number=f"CMD-STATUT-{index}",
+                status=value,
+            )
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_201_CREATED,
+                msg=f"Statut refusé à tort : {value}",
+            )
+            self.assertEqual(response.data["status"], value)
+
+    # --- champs client ----------------------------------------------------
+    def test_customer_name_is_required(self):
+        self.assertRejected(self.create_order(customer_name=""), "customer_name")
+
+    def test_customer_phone_remains_optional(self):
+        payload = self.order_payload()
+        payload.pop("customer_phone")
+
+        response = self.client.post(reverse("order-list"), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["customer_phone"], "")
+
+    # --- 7. modification valide ------------------------------------------
+    def test_valid_update_succeeds(self):
+        detail = reverse("order-detail", args=[self.order.id])
+
+        response = self.client.patch(
+            detail,
+            {"quantity": 5, "status": Order.Status.SHIPPED},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.quantity, 5)
+        self.assertEqual(self.order.status, Order.Status.SHIPPED)
+        self.assertEqual(response.data["total_amount"], "7500.00")
+
+    def test_update_refuses_negative_unit_price(self):
+        detail = reverse("order-detail", args=[self.order.id])
+
+        response = self.client.patch(detail, {"unit_price": "-1.00"})
+
+        self.assertRejected(response, "unit_price")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.unit_price, Decimal("1500.00"))
+
+    def test_update_does_not_modify_stock(self):
+        before = self.product.stock_quantity
+        detail = reverse("order-detail", args=[self.order.id])
+
+        self.client.patch(detail, {"status": Order.Status.DELIVERED})
+
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, before)
+
+    # --- 8. prix historique ----------------------------------------------
+    def test_changing_product_price_does_not_rewrite_existing_orders(self):
+        self.product.selling_price = "1999.00"
+        self.product.save(update_fields=["selling_price"])
+
+        detail = reverse("order-detail", args=[self.order.id])
+        response = self.client.get(detail)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["unit_price"], "1500.00")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.unit_price, Decimal("1500.00"))
+
+    def test_order_keeps_the_price_provided_at_creation(self):
+        response = self.create_order(unit_price="1234.56")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["unit_price"], "1234.56")
+
+    def test_status_change_keeps_the_recorded_price(self):
+        detail = reverse("order-detail", args=[self.order.id])
+
+        self.client.patch(detail, {"status": Order.Status.DELIVERED})
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.unit_price, Decimal("1500.00"))
+
+    # --- 10. suppression --------------------------------------------------
+    def test_order_deletion_succeeds_without_touching_stock(self):
+        before = self.product.stock_quantity
+        detail = reverse("order-detail", args=[self.order.id])
+
+        response = self.client.delete(detail)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Order.objects.filter(id=self.order.id).exists())
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, before)
+
+    # --- 9. authentification ---------------------------------------------
+    def test_anonymous_write_is_refused_before_validation(self):
+        self.client.credentials()
+
+        response = self.client.post(reverse("order-list"), self.order_payload(quantity=0))
+
+        self.assertRefused(response)
+        self.assertNotIn("quantity", response.data)
