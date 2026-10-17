@@ -277,3 +277,175 @@ class LogoutTests(SecuredApiTestCase):
             self.client.get(reverse("product-list")).status_code,
             status.HTTP_200_OK,
         )
+
+
+class DashboardEmptyDatabaseTests(APITestCase):
+    """Dashboard sur une base vide : des zéros réels, aucune donnée inventée."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="base-vide", password=PASSWORD)
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.token.key}")
+
+    def get_dashboard(self):
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def test_empty_database_returns_zero_counts(self):
+        data = self.get_dashboard()
+
+        self.assertEqual(data["counts"]["products"], 0)
+        self.assertEqual(data["counts"]["orders"], 0)
+        self.assertEqual(data["counts"]["pendingOrders"], 0)
+        self.assertEqual(data["counts"]["deliveredOrders"], 0)
+        self.assertEqual(sum(data["counts"]["ordersByStatus"].values()), 0)
+
+    def test_empty_database_returns_zero_amounts(self):
+        data = self.get_dashboard()
+
+        for key in ("realized", "inProgress", "cancelled", "allOrders"):
+            self.assertEqual(data["revenue"][key], "0.00")
+
+        self.assertEqual(data["deliveryCosts"]["allOrders"], "0.00")
+        self.assertEqual(data["costs"]["realized"]["total"], "0.00")
+        self.assertEqual(data["profit"]["realized"], "0.00")
+
+    def test_empty_database_has_no_sales_series(self):
+        self.assertEqual(self.get_dashboard()["salesSeries"], [])
+
+
+class DashboardMetricsTests(SecuredApiTestCase):
+    """Indicateurs du dashboard calculés depuis la base réelle.
+
+    Fixture de base : produit (achat 1000, vente 1500, emballage 0) et une
+    commande en attente (quantité 2, prix unitaire 1500, livraison 0).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.authenticate()
+
+    def get_dashboard(self):
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def test_anonymous_access_is_refused(self):
+        self.client.credentials()
+        self.assertRefused(self.client.get(reverse("dashboard")))
+
+    def test_counts_reflect_the_database(self):
+        data = self.get_dashboard()
+
+        self.assertEqual(data["counts"]["products"], 1)
+        self.assertEqual(data["counts"]["orders"], 1)
+        self.assertEqual(data["counts"]["pendingOrders"], 1)
+        self.assertEqual(data["counts"]["deliveredOrders"], 0)
+        self.assertEqual(
+            set(data["counts"]["ordersByStatus"]),
+            {value for value, _ in Order.Status.choices},
+        )
+        self.assertEqual(data["counts"]["ordersByStatus"]["pending"], 1)
+
+    def test_pending_order_is_not_counted_as_realized_revenue(self):
+        data = self.get_dashboard()
+
+        self.assertEqual(data["revenue"]["realized"], "0.00")
+        self.assertEqual(data["revenue"]["inProgress"], "3000.00")
+        self.assertEqual(data["revenue"]["allOrders"], "3000.00")
+
+    def test_delivered_order_produces_realized_revenue_and_estimated_costs(self):
+        self.product.packaging_cost = "50.00"
+        self.product.save(update_fields=["packaging_cost"])
+        self.order.status = Order.Status.DELIVERED
+        self.order.save(update_fields=["status"])
+
+        data = self.get_dashboard()
+
+        self.assertEqual(data["revenue"]["realized"], "3000.00")
+        self.assertEqual(data["revenue"]["inProgress"], "0.00")
+
+        costs = data["costs"]["realized"]
+        self.assertEqual(costs["purchase"], "2000.00")
+        self.assertEqual(costs["packaging"], "100.00")
+        self.assertEqual(costs["delivery"], "0.00")
+        self.assertEqual(costs["total"], "2100.00")
+        self.assertTrue(costs["estimated"])
+
+        self.assertEqual(data["profit"]["realized"], "900.00")
+        self.assertTrue(data["profit"]["estimated"])
+
+    def test_refused_and_returned_orders_are_excluded_from_realized_revenue(self):
+        self.order.status = Order.Status.REFUSED
+        self.order.save(update_fields=["status"])
+        Order.objects.create(
+            order_number="CMD-RETOURNEE-2",
+            customer_name="Client retour",
+            product=self.product,
+            quantity=1,
+            unit_price="1500.00",
+            status=Order.Status.RETURNED,
+        )
+
+        data = self.get_dashboard()
+
+        self.assertEqual(data["revenue"]["realized"], "0.00")
+        self.assertEqual(data["revenue"]["cancelled"], "4500.00")
+        self.assertEqual(data["counts"]["cancelledOrders"], 2)
+        self.assertEqual(data["counts"]["deliveredOrders"], 0)
+
+    def test_delivery_costs_use_the_frozen_order_value(self):
+        self.order.delivery_cost = "20.00"
+        self.order.save(update_fields=["delivery_cost"])
+
+        data = self.get_dashboard()
+        self.assertEqual(data["deliveryCosts"]["allOrders"], "20.00")
+        self.assertEqual(data["deliveryCosts"]["realized"], "0.00")
+
+        self.order.status = Order.Status.DELIVERED
+        self.order.save(update_fields=["status"])
+
+        data = self.get_dashboard()
+        self.assertEqual(data["deliveryCosts"]["realized"], "20.00")
+        self.assertEqual(data["costs"]["realized"]["delivery"], "20.00")
+
+    def test_sales_series_groups_revenue_by_day_and_ignores_other_statuses(self):
+        self.order.status = Order.Status.DELIVERED
+        self.order.save(update_fields=["status"])
+        Order.objects.create(
+            order_number="CMD-LIVREE-2",
+            customer_name="Client livré",
+            product=self.product,
+            quantity=1,
+            unit_price="1500.00",
+            status=Order.Status.DELIVERED,
+        )
+        Order.objects.create(
+            order_number="CMD-EN-ATTENTE-3",
+            customer_name="Client en attente",
+            product=self.product,
+            quantity=5,
+            unit_price="1500.00",
+            status=Order.Status.PENDING,
+        )
+
+        series = self.get_dashboard()["salesSeries"]
+
+        self.assertEqual(len(series), 1)
+        self.assertEqual(series[0]["orders"], 2)
+        self.assertEqual(series[0]["revenue"], "4500.00")
+        self.assertEqual(len(series[0]["date"]), 10)
+
+    def test_payload_contains_no_fictitious_indicators(self):
+        data = self.get_dashboard()
+
+        self.assertNotIn("adSpend", data)
+        self.assertNotIn("sales", data)
+        self.assertNotIn("deliveryCosts_", data)
+        self.assertEqual(data["currency"], "DZD")
+        self.assertIn("generatedAt", data)
+        self.assertEqual(
+            [metric["key"] for metric in data["unavailableMetrics"]],
+            ["adSpend", "historicalUnitCosts"],
+        )

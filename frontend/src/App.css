@@ -217,19 +217,6 @@
   flex-wrap: wrap;
 }
 
-.demo-badge {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 7px 10px;
-  border: 1px solid #e4e8ef;
-  border-radius: 7px;
-  color: #707d92;
-  background: white;
-  font-size: 10px;
-  font-weight: 650;
-}
-
 .status-dot,
 .period-dot {
   width: 6px;
@@ -504,6 +491,29 @@
   height: 250px;
   margin-top: 17px;
   direction: ltr;
+}
+
+.chart-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 22px;
+  text-align: center;
+  color: #9aa3b3;
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+.chart-empty p {
+  margin: 0;
+}
+
+.chart-empty span {
+  color: #b3bac7;
+  font-size: 10px;
 }
 
 .breakdown-total {
