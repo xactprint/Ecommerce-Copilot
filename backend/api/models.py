@@ -91,6 +91,17 @@ class Order(models.Model):
         default=0,
         verbose_name="Coût de livraison (DZD)",
     )
+    purchase_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Prix d'achat unitaire historique (DZD)",
+    )
+    packaging_cost = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        verbose_name="Coût d'emballage unitaire historique (DZD)",
+    )
     status = models.CharField(
         max_length=20,
         choices=Status.choices,
@@ -122,6 +133,26 @@ class Order(models.Model):
     @property
     def total_amount(self):
         return self.unit_price * self.quantity
+
+    @property
+    def purchase_cost(self):
+        """Coût d'achat total, calculé depuis le snapshot historique."""
+        return self.purchase_price * self.quantity
+
+    @property
+    def packaging_cost_total(self):
+        """Coût d'emballage total, calculé depuis le snapshot historique."""
+        return self.packaging_cost * self.quantity
+
+    @property
+    def gross_profit(self):
+        """Marge brute : revenus - achat - emballage (hors livraison)."""
+        return self.total_amount - self.purchase_cost - self.packaging_cost_total
+
+    @property
+    def net_result_after_delivery(self):
+        """Résultat net : marge brute - coût de livraison historique."""
+        return self.gross_profit - self.delivery_cost
 
     def __str__(self):
         return self.order_number

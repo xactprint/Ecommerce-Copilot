@@ -196,7 +196,14 @@ class OrderViewSet(viewsets.ModelViewSet):
                 }
             )
 
-        serializer.save()
+        # Snapshots historiques des coûts : capturés depuis le produit au
+        # moment de la création, jamais choisis par le client (champs en
+        # lecture seule dans le serializer).
+        product = serializer.validated_data["product"]
+        serializer.save(
+            purchase_price=product.purchase_price,
+            packaging_cost=product.packaging_cost,
+        )
 
     def perform_update(self, serializer):
         order = serializer.instance

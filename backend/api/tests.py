@@ -37,6 +37,7 @@ class SecuredApiTestCase(APITestCase):
             product=self.product,
             quantity=2,
             unit_price="1500.00",
+            purchase_price="1000.00",
         )
 
     def authenticate(self):
@@ -390,6 +391,7 @@ class DashboardMetricsTests(SecuredApiTestCase):
             product=self.product,
             quantity=1,
             unit_price="1500.00",
+            purchase_price="1000.00",
             status=Order.Status.RETURNED,
         )
 
@@ -424,6 +426,7 @@ class DashboardMetricsTests(SecuredApiTestCase):
             product=self.product,
             quantity=1,
             unit_price="1500.00",
+            purchase_price="1000.00",
             status=Order.Status.DELIVERED,
         )
         Order.objects.create(
@@ -432,6 +435,7 @@ class DashboardMetricsTests(SecuredApiTestCase):
             product=self.product,
             quantity=5,
             unit_price="1500.00",
+            purchase_price="1000.00",
             status=Order.Status.PENDING,
         )
 
@@ -831,6 +835,7 @@ class OrderStockTransitionTests(SecuredApiTestCase):
             product=self.product,
             quantity=quantity,
             unit_price="1500.00",
+            purchase_price="1000.00",
             status=order_status,
         )
 
@@ -1413,6 +1418,182 @@ class OrderStockTransitionTests(SecuredApiTestCase):
         self.assertEqual(self.stock(), 10)
 
 
+class OrderCostSnapshotTests(SecuredApiTestCase):
+    """Snapshots historiques des coûts produit figés sur la commande.
+
+    Fixture : produit à 85.00 d'achat et 5.00 d'emballage, prix de vente 120.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.authenticate()
+        self.product.purchase_price = "85.00"
+        self.product.packaging_cost = "5.00"
+        self.product.save(update_fields=["purchase_price", "packaging_cost"])
+
+    def detail(self, order):
+        return reverse("order-detail", args=[order.id])
+
+    def create_order(self, **overrides):
+        payload = {
+            "order_number": "CMD-SNAP-1",
+            "customer_name": "Client snapshot",
+            "product": self.product.id,
+            "quantity": 2,
+            "unit_price": "120.00",
+            "delivery_cost": "20.00",
+        }
+        payload.update(overrides)
+        return self.client.post(reverse("order-list"), payload)
+
+    def patch_status(self, order, new_status):
+        return self.client.patch(self.detail(order), {"status": new_status})
+
+    def stock(self):
+        self.product.refresh_from_db()
+        return self.product.stock_quantity
+
+    def snapshot(self, order):
+        order.refresh_from_db()
+        return order.purchase_price, order.packaging_cost
+
+    # --- A / E : création -------------------------------------------------
+    def test_creation_freezes_the_product_costs(self):
+        response = self.create_order()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertEqual(order.status, Order.Status.PENDING)
+        self.assertEqual(response.data["purchase_price"], "85.00")
+        self.assertEqual(response.data["packaging_cost"], "5.00")
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    # --- B : client malveillant ------------------------------------------
+    def test_client_cannot_impose_the_snapshots(self):
+        response = self.create_order(purchase_price="1.00", packaging_cost="0.00")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        order = Order.objects.get(pk=response.data["id"])
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    # --- C : le produit change, le snapshot non --------------------------
+    def test_product_change_does_not_rewrite_the_snapshots(self):
+        order = Order.objects.get(pk=self.create_order().data["id"])
+
+        self.product.purchase_price = "100.00"
+        self.product.packaging_cost = "10.00"
+        self.product.save(update_fields=["purchase_price", "packaging_cost"])
+
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    # --- D : ni PATCH ni PUT ne modifient les snapshots -------------------
+    def test_patch_cannot_change_the_snapshots(self):
+        order = Order.objects.get(pk=self.create_order().data["id"])
+
+        response = self.client.patch(
+            self.detail(order),
+            {"purchase_price": "1.00", "packaging_cost": "0.00"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    def test_put_cannot_change_the_snapshots(self):
+        order = Order.objects.get(pk=self.create_order().data["id"])
+
+        response = self.client.put(
+            self.detail(order),
+            {
+                "order_number": order.order_number,
+                "customer_name": order.customer_name,
+                "customer_phone": order.customer_phone,
+                "product": order.product_id,
+                "quantity": order.quantity,
+                "unit_price": str(order.unit_price),
+                "delivery_cost": str(order.delivery_cost),
+                "status": order.status,
+                "notes": order.notes,
+                "purchase_price": "1.00",
+                "packaging_cost": "0.00",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    # --- F : transition confirmed ----------------------------------------
+    def test_confirmation_deducts_stock_and_keeps_the_snapshots(self):
+        self.product.stock_quantity = 10
+        self.product.save(update_fields=["stock_quantity"])
+        order = Order.objects.get(pk=self.create_order().data["id"])
+
+        response = self.patch_status(order, Order.Status.CONFIRMED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order.refresh_from_db()
+        self.assertEqual(self.stock(), 8)
+        self.assertTrue(order.stock_deducted)
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    # --- G : restitution --------------------------------------------------
+    def test_refusal_restores_stock_and_keeps_the_snapshots(self):
+        self.product.stock_quantity = 10
+        self.product.save(update_fields=["stock_quantity"])
+        order = Order.objects.get(pk=self.create_order().data["id"])
+        self.patch_status(order, Order.Status.CONFIRMED)
+
+        response = self.patch_status(order, Order.Status.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order.refresh_from_db()
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(order.stock_deducted)
+        self.assertEqual(self.snapshot(order), (Decimal("85.00"), Decimal("5.00")))
+
+    # --- I : rentabilité --------------------------------------------------
+    def test_profitability_is_computed_from_the_snapshots(self):
+        order = Order.objects.create(
+            order_number="CMD-PROFIT-1",
+            customer_name="Client rentabilité",
+            product=self.product,
+            quantity=2,
+            unit_price="120.00",
+            purchase_price="85.00",
+            packaging_cost="5.00",
+            delivery_cost="20.00",
+        )
+        order.refresh_from_db()
+
+        self.assertEqual(order.total_amount, Decimal("240.00"))
+        self.assertEqual(order.purchase_cost, Decimal("170.00"))
+        self.assertEqual(order.packaging_cost_total, Decimal("10.00"))
+        self.assertEqual(order.gross_profit, Decimal("60.00"))
+        self.assertEqual(order.net_result_after_delivery, Decimal("40.00"))
+
+    def test_profitability_is_exposed_by_the_api(self):
+        order = Order.objects.create(
+            order_number="CMD-PROFIT-2",
+            customer_name="Client rentabilité",
+            product=self.product,
+            quantity=2,
+            unit_price="120.00",
+            purchase_price="85.00",
+            packaging_cost="5.00",
+            delivery_cost="20.00",
+        )
+
+        response = self.client.get(self.detail(order))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["purchase_price"], "85.00")
+        self.assertEqual(response.data["packaging_cost"], "5.00")
+        self.assertEqual(response.data["total_amount"], "240.00")
+        self.assertEqual(response.data["purchase_cost"], "170.00")
+        self.assertEqual(response.data["packaging_cost_total"], "10.00")
+        self.assertEqual(response.data["gross_profit"], "60.00")
+        self.assertEqual(response.data["net_result_after_delivery"], "40.00")
+
+
 class OrderStockDeductedMigrationTests(TransactionTestCase):
     """Migration 0002 : le marqueur des lignes existantes passe à False.
 
@@ -1453,7 +1634,7 @@ class OrderStockDeductedMigrationTests(TransactionTestCase):
             product_pk = product.pk
         finally:
             executor = MigrationExecutor(connection)
-            executor.migrate([("api", "0002_order_stock_deducted")])
+            executor.migrate(executor.loader.graph.leaf_nodes())
 
         new_apps = executor.loader.project_state(
             [("api", "0002_order_stock_deducted")]
@@ -1471,3 +1652,70 @@ class OrderStockDeductedMigrationTests(TransactionTestCase):
 
         migrated_product = NewProduct.objects.get(pk=product_pk)
         self.assertEqual(migrated_product.stock_quantity, 5)
+
+
+class OrderCostSnapshotMigrationTests(TransactionTestCase):
+    """Migration 0003 : les coûts produit sont figés sur les commandes.
+
+    Les commandes antérieures sont remplies depuis les valeurs actuelles de
+    leur produit ; aucune autre donnée (statut, quantité, prix, livraison,
+    notes, produit, stock) ne doit être modifiée.
+    """
+
+    def test_existing_orders_are_filled_from_their_product(self):
+        executor = MigrationExecutor(connection)
+        order_pk = None
+        product_pk = None
+        try:
+            executor.migrate([("api", "0002_order_stock_deducted")])
+            old_apps = executor.loader.project_state(
+                [("api", "0002_order_stock_deducted")]
+            ).apps
+            OldProduct = old_apps.get_model("api", "Product")
+            OldOrder = old_apps.get_model("api", "Order")
+
+            product = OldProduct.objects.create(
+                name="Produit historique",
+                purchase_price="85.00",
+                selling_price="120.00",
+                packaging_cost="5.00",
+                stock_quantity=9,
+            )
+            order = OldOrder.objects.create(
+                order_number="CMD-MIGRATION-COST-1",
+                customer_name="Client historique",
+                product=product,
+                quantity=4,
+                unit_price="120.00",
+                delivery_cost="20.00",
+                status="confirmed",
+                notes="note historique",
+                stock_deducted=True,
+            )
+            order_pk = order.pk
+            product_pk = product.pk
+        finally:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+
+        new_apps = executor.loader.project_state(
+            executor.loader.graph.leaf_nodes()
+        ).apps
+        NewOrder = new_apps.get_model("api", "Order")
+        NewProduct = new_apps.get_model("api", "Product")
+
+        migrated_order = NewOrder.objects.get(pk=order_pk)
+        self.assertEqual(migrated_order.purchase_price, Decimal("85.00"))
+        self.assertEqual(migrated_order.packaging_cost, Decimal("5.00"))
+        self.assertEqual(migrated_order.status, "confirmed")
+        self.assertEqual(migrated_order.quantity, 4)
+        self.assertEqual(migrated_order.unit_price, Decimal("120.00"))
+        self.assertEqual(migrated_order.delivery_cost, Decimal("20.00"))
+        self.assertEqual(migrated_order.product_id, product_pk)
+        self.assertEqual(migrated_order.notes, "note historique")
+        self.assertTrue(migrated_order.stock_deducted)
+
+        migrated_product = NewProduct.objects.get(pk=product_pk)
+        self.assertEqual(migrated_product.purchase_price, Decimal("85.00"))
+        self.assertEqual(migrated_product.packaging_cost, Decimal("5.00"))
+        self.assertEqual(migrated_product.stock_quantity, 9)
