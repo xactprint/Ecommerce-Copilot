@@ -3,7 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import connection, transaction
-from django.db.models import Count, DecimalField, ExpressionWrapper, F, Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -26,12 +26,14 @@ ORDER_REVENUE = ExpressionWrapper(
     F("quantity") * F("unit_price"),
     output_field=MONEY_FIELD,
 )
+# Les coûts proviennent des snapshots historiques portés par la commande
+# elle-même : modifier le produit n'affecte plus la rentabilité passée.
 ORDER_PURCHASE_COST = ExpressionWrapper(
-    F("quantity") * F("product__purchase_price"),
+    F("quantity") * F("purchase_price"),
     output_field=MONEY_FIELD,
 )
 ORDER_PACKAGING_COST = ExpressionWrapper(
-    F("quantity") * F("product__packaging_cost"),
+    F("quantity") * F("packaging_cost"),
     output_field=MONEY_FIELD,
 )
 
@@ -198,11 +200,13 @@ class OrderViewSet(viewsets.ModelViewSet):
 
         # Snapshots historiques des coûts : capturés depuis le produit au
         # moment de la création, jamais choisis par le client (champs en
-        # lecture seule dans le serializer).
+        # lecture seule dans le serializer). Les coûts d'une commande créée
+        # via l'API sont réels, donc jamais marqués comme estimés.
         product = serializer.validated_data["product"]
         serializer.save(
             purchase_price=product.purchase_price,
             packaging_cost=product.packaging_cost,
+            costs_estimated=False,
         )
 
     def perform_update(self, serializer):
@@ -299,6 +303,8 @@ def _empty_totals() -> dict:
         "purchase": ZERO,
         "packaging": ZERO,
         "delivery": ZERO,
+        # Nombre de commandes dont les coûts sont estimés (reconstruits).
+        "estimated": 0,
     }
 
 
@@ -313,6 +319,7 @@ def _sum_statuses(by_status: dict, statuses) -> dict:
         totals["purchase"] += row["purchase"]
         totals["packaging"] += row["packaging"]
         totals["delivery"] += row["delivery"]
+        totals["estimated"] += row["estimated"]
 
     return totals
 
@@ -325,17 +332,24 @@ def dashboard(request):
     - Une seule requête agrégée par statut (Count/Sum côté base de données).
     - Le chiffre d'affaires d'une commande est `quantity * unit_price` ;
       `unit_price` est figé au moment de la commande, donc fiable.
-    - Les coûts d'achat et d'emballage utilisent les prix actuels du produit
-      (non figés à la commande) : ils sont explicitement marqués « estimated ».
+    - Les coûts d'achat et d'emballage proviennent des snapshots historiques
+      de chaque commande (`purchase_price` / `packaging_cost`) : modifier le
+      produit ne réécrit plus la rentabilité passée.
+    - `estimated` ne vaut `True` que si au moins une commande incluse a des
+      coûts reconstruits (`costs_estimated`), c'est-à-dire antérieure au
+      snapshot historique.
     - Aucune dépense publicitaire n'existe en base : l'indicateur est déclaré
       comme indisponible au lieu d'être inventé.
     """
+    estimated_orders = Count("id", filter=Q(costs_estimated=True))
+
     rows = Order.objects.values("status").annotate(
         orders=Count("id"),
         revenue=Sum(ORDER_REVENUE),
         purchase=Sum(ORDER_PURCHASE_COST),
         packaging=Sum(ORDER_PACKAGING_COST),
         delivery=Sum("delivery_cost"),
+        estimated=estimated_orders,
     )
 
     by_status = {
@@ -348,6 +362,7 @@ def dashboard(request):
             "purchase": row["purchase"] or ZERO,
             "packaging": row["packaging"] or ZERO,
             "delivery": row["delivery"] or ZERO,
+            "estimated": row["estimated"] or 0,
         }
 
     realized = _sum_statuses(by_status, REALIZED_STATUSES)
@@ -358,13 +373,24 @@ def dashboard(request):
     realized_costs_total = (
         realized["purchase"] + realized["packaging"] + realized["delivery"]
     )
+    realized_gross_profit = (
+        realized["revenue"] - realized["purchase"] - realized["packaging"]
+    )
+    realized_costs_estimated = realized["estimated"] > 0
 
     since = timezone.now() - timedelta(days=SALES_SERIES_DAYS - 1)
     series = (
         Order.objects.filter(status__in=REALIZED_STATUSES, created_at__gte=since)
         .annotate(day=TruncDate("created_at"))
         .values("day")
-        .annotate(revenue=Sum(ORDER_REVENUE), orders=Count("id"))
+        .annotate(
+            revenue=Sum(ORDER_REVENUE),
+            purchase=Sum(ORDER_PURCHASE_COST),
+            packaging=Sum(ORDER_PACKAGING_COST),
+            delivery=Sum("delivery_cost"),
+            orders=Count("id"),
+            estimated=estimated_orders,
+        )
         .order_by("day")
     )
 
@@ -395,7 +421,7 @@ def dashboard(request):
         },
         "costs": {
             "realized": {
-                "estimated": True,
+                "estimated": realized_costs_estimated,
                 "purchase": _money(realized["purchase"]),
                 "packaging": _money(realized["packaging"]),
                 "delivery": _money(realized["delivery"]),
@@ -403,13 +429,29 @@ def dashboard(request):
             }
         },
         "profit": {
-            "estimated": True,
+            "estimated": realized_costs_estimated,
             "realized": _money(realized["revenue"] - realized_costs_total),
+            "gross": _money(realized_gross_profit),
         },
         "salesSeries": [
             {
                 "date": row["day"].isoformat(),
                 "revenue": _money(row["revenue"]),
+                "purchase": _money(row["purchase"] or ZERO),
+                "packaging": _money(row["packaging"] or ZERO),
+                "delivery": _money(row["delivery"] or ZERO),
+                "grossProfit": _money(
+                    (row["revenue"] or ZERO)
+                    - (row["purchase"] or ZERO)
+                    - (row["packaging"] or ZERO)
+                ),
+                "netProfit": _money(
+                    (row["revenue"] or ZERO)
+                    - (row["purchase"] or ZERO)
+                    - (row["packaging"] or ZERO)
+                    - (row["delivery"] or ZERO)
+                ),
+                "estimated": (row["estimated"] or 0) > 0,
                 "orders": row["orders"],
             }
             for row in series
@@ -424,17 +466,6 @@ def dashboard(request):
                 "requiredData": (
                     "Un modèle AdSpend (date, montant, canal) pour agréger "
                     "les dépenses publicitaires."
-                ),
-            },
-            {
-                "key": "historicalUnitCosts",
-                "reason": (
-                    "purchase_price et packaging_cost proviennent du produit "
-                    "actuel : ils ne sont pas figés au moment de la commande."
-                ),
-                "requiredData": (
-                    "Copier les coûts d'achat et d'emballage sur Order à la "
-                    "création pour un historique exact."
                 ),
             },
         ],

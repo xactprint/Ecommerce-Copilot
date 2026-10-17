@@ -102,6 +102,15 @@ class Order(models.Model):
         default=0,
         verbose_name="Coût d'emballage unitaire historique (DZD)",
     )
+    costs_estimated = models.BooleanField(
+        default=False,
+        verbose_name="Coûts estimés",
+        help_text=(
+            "Vrai lorsque purchase_price / packaging_cost ont été reconstruits "
+            "(commandes antérieures au snapshot) et ne reflètent donc pas le "
+            "coût réel au moment de la commande."
+        ),
+    )
     status = models.CharField(
         max_length=20,
         choices=Status.choices,

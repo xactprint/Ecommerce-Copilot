@@ -361,7 +361,10 @@ class DashboardMetricsTests(SecuredApiTestCase):
         self.assertEqual(data["revenue"]["inProgress"], "3000.00")
         self.assertEqual(data["revenue"]["allOrders"], "3000.00")
 
-    def test_delivered_order_produces_realized_revenue_and_estimated_costs(self):
+    def test_delivered_order_uses_the_order_snapshot_costs(self):
+        # Les coûts proviennent du snapshot de la commande (achat 1000,
+        # emballage 0 par défaut), et non du produit courant : modifier le
+        # produit ici ne doit rien changer à la rentabilité passée.
         self.product.packaging_cost = "50.00"
         self.product.save(update_fields=["packaging_cost"])
         self.order.status = Order.Status.DELIVERED
@@ -374,13 +377,14 @@ class DashboardMetricsTests(SecuredApiTestCase):
 
         costs = data["costs"]["realized"]
         self.assertEqual(costs["purchase"], "2000.00")
-        self.assertEqual(costs["packaging"], "100.00")
+        self.assertEqual(costs["packaging"], "0.00")
         self.assertEqual(costs["delivery"], "0.00")
-        self.assertEqual(costs["total"], "2100.00")
-        self.assertTrue(costs["estimated"])
+        self.assertEqual(costs["total"], "2000.00")
+        self.assertFalse(costs["estimated"])
 
-        self.assertEqual(data["profit"]["realized"], "900.00")
-        self.assertTrue(data["profit"]["estimated"])
+        self.assertEqual(data["profit"]["realized"], "1000.00")
+        self.assertEqual(data["profit"]["gross"], "1000.00")
+        self.assertFalse(data["profit"]["estimated"])
 
     def test_refused_and_returned_orders_are_excluded_from_realized_revenue(self):
         self.order.status = Order.Status.REFUSED
@@ -456,7 +460,7 @@ class DashboardMetricsTests(SecuredApiTestCase):
         self.assertIn("generatedAt", data)
         self.assertEqual(
             [metric["key"] for metric in data["unavailableMetrics"]],
-            ["adSpend", "historicalUnitCosts"],
+            ["adSpend"],
         )
 
 
@@ -1719,3 +1723,223 @@ class OrderCostSnapshotMigrationTests(TransactionTestCase):
         self.assertEqual(migrated_product.purchase_price, Decimal("85.00"))
         self.assertEqual(migrated_product.packaging_cost, Decimal("5.00"))
         self.assertEqual(migrated_product.stock_quantity, 9)
+
+
+class DashboardHistoricalCostTests(SecuredApiTestCase):
+    """Le dashboard financier s'appuie sur les snapshots historiques.
+
+    Fixture de base : produit (achat 1000, vente 1500, emballage 0) et une
+    commande « CMD-TEST-1 » (quantité 2, prix 1500, achat 1000, emballage 0).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.authenticate()
+
+    def get_dashboard(self):
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    def order_payload(self, **overrides):
+        payload = {
+            "order_number": "CMD-DASH-1",
+            "customer_name": "Client dashboard",
+            "product": self.product.id,
+            "quantity": 1,
+            "unit_price": "1500.00",
+        }
+        payload.update(overrides)
+        return payload
+
+    def deliver(self, order):
+        order.status = Order.Status.DELIVERED
+        order.save(update_fields=["status"])
+
+    # --- 1. snapshots, pas le produit courant ----------------------------
+    def test_realized_costs_ignore_later_product_price_changes(self):
+        self.deliver(self.order)
+
+        before = self.get_dashboard()["costs"]["realized"]
+
+        self.product.purchase_price = "9000.00"
+        self.product.packaging_cost = "777.00"
+        self.product.save(update_fields=["purchase_price", "packaging_cost"])
+
+        after = self.get_dashboard()["costs"]["realized"]
+
+        self.assertEqual(before, after)
+        self.assertEqual(after["purchase"], "2000.00")
+        self.assertEqual(after["packaging"], "0.00")
+        self.assertEqual(after["total"], "2000.00")
+
+    # --- 2. marqueur estimé ----------------------------------------------
+    def test_costs_are_not_estimated_by_default(self):
+        self.deliver(self.order)
+
+        data = self.get_dashboard()
+
+        self.assertFalse(data["costs"]["realized"]["estimated"])
+        self.assertFalse(data["profit"]["estimated"])
+
+    def test_any_estimated_delivered_order_flags_the_aggregate(self):
+        self.deliver(self.order)
+        Order.objects.filter(pk=self.order.pk).update(costs_estimated=True)
+
+        data = self.get_dashboard()
+
+        self.assertTrue(data["costs"]["realized"]["estimated"])
+        self.assertTrue(data["profit"]["estimated"])
+
+    def test_estimated_flag_is_true_only_while_an_estimated_order_is_included(self):
+        self.deliver(self.order)
+        Order.objects.filter(pk=self.order.pk).update(costs_estimated=True)
+        self.assertTrue(self.get_dashboard()["costs"]["realized"]["estimated"])
+
+        Order.objects.filter(pk=self.order.pk).update(costs_estimated=False)
+
+        self.assertFalse(self.get_dashboard()["costs"]["realized"]["estimated"])
+
+    def test_estimated_order_outside_realized_statuses_does_not_flag_costs(self):
+        # La commande reste en attente : elle n'est pas incluse dans les
+        # coûts réalisés, son marqueur ne doit donc pas faire basculer le flag.
+        Order.objects.filter(pk=self.order.pk).update(costs_estimated=True)
+
+        data = self.get_dashboard()
+
+        self.assertFalse(data["costs"]["realized"]["estimated"])
+        self.assertEqual(data["costs"]["realized"]["total"], "0.00")
+
+    # --- 3. règles de statut inchangées -----------------------------------
+    def test_realized_costs_exclude_non_delivered_orders(self):
+        data = self.get_dashboard()
+
+        costs = data["costs"]["realized"]
+        self.assertEqual(costs["purchase"], "0.00")
+        self.assertEqual(costs["packaging"], "0.00")
+        self.assertEqual(costs["total"], "0.00")
+        self.assertFalse(costs["estimated"])
+        self.assertEqual(data["revenue"]["inProgress"], "3000.00")
+
+    # --- 4. série temporelle ---------------------------------------------
+    def test_sales_series_uses_order_snapshots(self):
+        self.deliver(self.order)
+
+        point = self.get_dashboard()["salesSeries"][0]
+
+        self.assertEqual(point["revenue"], "3000.00")
+        self.assertEqual(point["purchase"], "2000.00")
+        self.assertEqual(point["packaging"], "0.00")
+        self.assertEqual(point["delivery"], "0.00")
+        self.assertEqual(point["grossProfit"], "1000.00")
+        self.assertEqual(point["netProfit"], "1000.00")
+        self.assertFalse(point["estimated"])
+
+        self.product.purchase_price = "9000.00"
+        self.product.save(update_fields=["purchase_price"])
+
+        after = self.get_dashboard()["salesSeries"][0]
+        self.assertEqual(after["purchase"], "2000.00")
+        self.assertEqual(after["grossProfit"], "1000.00")
+
+    def test_sales_series_flags_estimated_day(self):
+        self.deliver(self.order)
+        Order.objects.filter(pk=self.order.pk).update(costs_estimated=True)
+
+        self.assertTrue(self.get_dashboard()["salesSeries"][0]["estimated"])
+
+    # --- 5. création via API ---------------------------------------------
+    def test_api_creation_captures_real_costs_and_never_marks_estimated(self):
+        response = self.client.post(
+            reverse("order-list"),
+            self.order_payload(costs_estimated=True),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["costs_estimated"])
+
+        order = Order.objects.get(order_number="CMD-DASH-1")
+        self.assertEqual(order.purchase_price, Decimal("1000.00"))
+        self.assertEqual(order.packaging_cost, Decimal("0.00"))
+        self.assertFalse(order.costs_estimated)
+
+
+class OrderCostsEstimatedMigrationTests(TransactionTestCase):
+    """La migration 0004 marque les commandes existantes comme estimées.
+
+    Les commandes antérieures ont des coûts reconstruits (migration 0003) :
+    elles doivent être signalées ``costs_estimated=True`` sans qu'aucune autre
+    donnée ne soit modifiée. Les commandes créées après gardent la valeur
+    ``False``.
+    """
+
+    def test_existing_orders_are_marked_estimated_without_other_changes(self):
+        executor = MigrationExecutor(connection)
+        order_pk = None
+        product_pk = None
+        try:
+            executor.migrate(
+                [("api", "0003_order_purchase_price_order_packaging_cost")]
+            )
+            old_apps = executor.loader.project_state(
+                [("api", "0003_order_purchase_price_order_packaging_cost")]
+            ).apps
+            OldProduct = old_apps.get_model("api", "Product")
+            OldOrder = old_apps.get_model("api", "Order")
+
+            product = OldProduct.objects.create(
+                name="Produit historique",
+                purchase_price="1000.00",
+                selling_price="1500.00",
+                stock_quantity=7,
+            )
+            order = OldOrder.objects.create(
+                order_number="CMD-MIGRATION-ESTIMEE",
+                customer_name="Client historique",
+                product=product,
+                quantity=2,
+                unit_price="1500.00",
+                purchase_price="1000.00",
+                packaging_cost="5.00",
+                delivery_cost="0.00",
+                status="delivered",
+                notes="note historique",
+            )
+            order_pk = order.pk
+            product_pk = product.pk
+        finally:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+
+        new_apps = executor.loader.project_state(
+            executor.loader.graph.leaf_nodes()
+        ).apps
+        NewOrder = new_apps.get_model("api", "Order")
+
+        migrated = NewOrder.objects.get(pk=order_pk)
+        self.assertTrue(migrated.costs_estimated)
+        self.assertEqual(migrated.purchase_price, Decimal("1000.00"))
+        self.assertEqual(migrated.packaging_cost, Decimal("5.00"))
+        self.assertEqual(migrated.status, "delivered")
+        self.assertEqual(migrated.quantity, 2)
+        self.assertEqual(migrated.unit_price, Decimal("1500.00"))
+        self.assertEqual(migrated.delivery_cost, Decimal("0.00"))
+        self.assertEqual(migrated.product_id, product_pk)
+        self.assertEqual(migrated.notes, "note historique")
+
+    def test_new_orders_created_after_the_migration_are_not_estimated(self):
+        product = Product.objects.create(
+            name="Produit courant",
+            purchase_price="1000.00",
+            selling_price="1500.00",
+        )
+        order = Order.objects.create(
+            order_number="CMD-APRES-MIGRATION-1",
+            customer_name="Client récent",
+            product=product,
+            quantity=1,
+            unit_price="1500.00",
+            purchase_price="1000.00",
+        )
+
+        self.assertFalse(order.costs_estimated)

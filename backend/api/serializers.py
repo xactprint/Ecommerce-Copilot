@@ -63,6 +63,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "unit_price",
             "purchase_price",
             "packaging_cost",
+            "costs_estimated",
             "delivery_cost",
             "status",
             "stock_deducted",
@@ -91,6 +92,9 @@ class OrderSerializer(serializers.ModelSerializer):
             # Marqueur de traçabilité du stock : géré exclusivement par le
             # serveur, jamais défini par le client.
             "stock_deducted",
+            # Marqueur de fiabilité des coûts : géré exclusivement par le
+            # serveur, jamais défini par le client.
+            "costs_estimated",
         ]
         # La quantité doit être strictement positive et les montants de la
         # commande ne peuvent pas être négatifs. Les bornes max_digits /
