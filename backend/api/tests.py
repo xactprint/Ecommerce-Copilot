@@ -578,8 +578,10 @@ class OrderValidationTests(SecuredApiTestCase):
     def test_unknown_status_is_refused(self):
         self.assertRejected(self.create_order(status="inconnu"), "status")
 
-    def test_all_six_documented_statuses_are_accepted(self):
-        for index, (value, _) in enumerate(Order.Status.choices):
+    def test_creation_accepts_pending_and_refused(self):
+        # Seuls ces deux statuts sont créables directement (aucun mouvement de
+        # stock) ; les autres s'obtiennent par une transition contrôlée.
+        for index, value in enumerate((Order.Status.PENDING, Order.Status.REFUSED)):
             response = self.create_order(
                 order_number=f"CMD-STATUT-{index}",
                 status=value,
@@ -590,6 +592,26 @@ class OrderValidationTests(SecuredApiTestCase):
                 msg=f"Statut refusé à tort : {value}",
             )
             self.assertEqual(response.data["status"], value)
+
+    def test_creation_in_controlled_statuses_is_refused(self):
+        controlled = (
+            Order.Status.CONFIRMED,
+            Order.Status.SHIPPED,
+            Order.Status.DELIVERED,
+            Order.Status.RETURNED,
+        )
+
+        for index, value in enumerate(controlled):
+            order_number = f"CMD-CONTROLE-{index}"
+            response = self.create_order(order_number=order_number, status=value)
+
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_400_BAD_REQUEST,
+                msg=f"Création acceptée à tort : {value}",
+            )
+            self.assertIn("status", response.data)
+            self.assertFalse(Order.objects.filter(order_number=order_number).exists())
 
     # --- champs client ----------------------------------------------------
     def test_customer_name_is_required(self):
@@ -610,13 +632,14 @@ class OrderValidationTests(SecuredApiTestCase):
 
         response = self.client.patch(
             detail,
-            {"quantity": 5, "status": Order.Status.SHIPPED},
+            {"quantity": 5, "customer_name": "Client mis à jour"},
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.order.refresh_from_db()
         self.assertEqual(self.order.quantity, 5)
-        self.assertEqual(self.order.status, Order.Status.SHIPPED)
+        self.assertEqual(self.order.customer_name, "Client mis à jour")
+        self.assertEqual(self.order.status, Order.Status.PENDING)
         self.assertEqual(response.data["total_amount"], "7500.00")
 
     def test_update_refuses_negative_unit_price(self):
@@ -628,14 +651,17 @@ class OrderValidationTests(SecuredApiTestCase):
         self.order.refresh_from_db()
         self.assertEqual(self.order.unit_price, Decimal("1500.00"))
 
-    def test_update_does_not_modify_stock(self):
+    def test_update_without_status_change_does_not_modify_stock(self):
         before = self.product.stock_quantity
         detail = reverse("order-detail", args=[self.order.id])
 
-        self.client.patch(detail, {"status": Order.Status.DELIVERED})
+        response = self.client.patch(detail, {"customer_name": "Autre nom"})
 
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.product.refresh_from_db()
+        self.order.refresh_from_db()
         self.assertEqual(self.product.stock_quantity, before)
+        self.assertEqual(self.order.status, Order.Status.PENDING)
 
     # --- 8. prix historique ----------------------------------------------
     def test_changing_product_price_does_not_rewrite_existing_orders(self):
@@ -659,9 +685,11 @@ class OrderValidationTests(SecuredApiTestCase):
     def test_status_change_keeps_the_recorded_price(self):
         detail = reverse("order-detail", args=[self.order.id])
 
-        self.client.patch(detail, {"status": Order.Status.DELIVERED})
+        response = self.client.patch(detail, {"status": Order.Status.REFUSED})
 
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.REFUSED)
         self.assertEqual(self.order.unit_price, Decimal("1500.00"))
 
     # --- 10. suppression --------------------------------------------------
@@ -684,3 +712,554 @@ class OrderValidationTests(SecuredApiTestCase):
 
         self.assertRefused(response)
         self.assertNotIn("quantity", response.data)
+
+
+class OrderStockTransitionTests(SecuredApiTestCase):
+    """Stock et transitions de statut des commandes.
+
+    Règle métier : décrément du stock à ``pending → confirmed`` ; restitution
+    sur ``confirmed → refused``, ``shipped → refused``, ``shipped → returned``
+    et ``delivered → returned``. La décision dépend de la transition
+    réellement demandée, jamais du seul statut final.
+
+    Fixture : produit à 10 en stock, commande « CMD-TEST-1 » en attente
+    (quantité 2).
+    """
+
+    PENDING = Order.Status.PENDING
+    CONFIRMED = Order.Status.CONFIRMED
+    SHIPPED = Order.Status.SHIPPED
+    DELIVERED = Order.Status.DELIVERED
+    REFUSED = Order.Status.REFUSED
+    RETURNED = Order.Status.RETURNED
+
+    # Chemins de transitions valides pour atteindre un statut depuis pending.
+    PATHS = {
+        Order.Status.PENDING: [],
+        Order.Status.CONFIRMED: [Order.Status.CONFIRMED],
+        Order.Status.SHIPPED: [Order.Status.CONFIRMED, Order.Status.SHIPPED],
+        Order.Status.DELIVERED: [
+            Order.Status.CONFIRMED,
+            Order.Status.SHIPPED,
+            Order.Status.DELIVERED,
+        ],
+        Order.Status.REFUSED: [Order.Status.REFUSED],
+        Order.Status.RETURNED: [
+            Order.Status.CONFIRMED,
+            Order.Status.SHIPPED,
+            Order.Status.RETURNED,
+        ],
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.authenticate()
+        self.product.stock_quantity = 10
+        self.product.save(update_fields=["stock_quantity"])
+
+    # --- utilitaires ------------------------------------------------------
+    def detail(self, order):
+        return reverse("order-detail", args=[order.id])
+
+    def patch_status(self, order, new_status):
+        return self.client.patch(self.detail(order), {"status": new_status})
+
+    def create_order(self, **overrides):
+        payload = {
+            "order_number": "CMD-STOCK-1",
+            "customer_name": "Client stock",
+            "product": self.product.id,
+            "quantity": 3,
+            "unit_price": "1500.00",
+            "delivery_cost": "0.00",
+        }
+        payload.update(overrides)
+        return self.client.post(reverse("order-list"), payload)
+
+    def stock(self):
+        self.product.refresh_from_db()
+        return self.product.stock_quantity
+
+    def reach(self, target, order=None):
+        order = order or self.order
+        for step in self.PATHS[target]:
+            response = self.patch_status(order, step)
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_200_OK,
+                msg=f"Étape de transition refusée : {step}",
+            )
+        order.refresh_from_db()
+        self.assertEqual(order.status, target)
+        return order
+
+    def assertTransitionRefused(self, order, target):
+        before_status = order.status
+        before_stock = self.stock()
+
+        response = self.patch_status(order, target)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", response.data)
+        order.refresh_from_db()
+        self.assertEqual(order.status, before_status)
+        self.assertEqual(self.stock(), before_stock)
+
+    def put_payload(self, order, **overrides):
+        payload = {
+            "order_number": order.order_number,
+            "customer_name": order.customer_name,
+            "customer_phone": order.customer_phone,
+            "product": order.product_id,
+            "quantity": order.quantity,
+            "unit_price": str(order.unit_price),
+            "delivery_cost": str(order.delivery_cost),
+            "status": order.status,
+            "notes": order.notes,
+        }
+        payload.update(overrides)
+        return payload
+
+    # --- confirmation -----------------------------------------------------
+    def test_confirmation_deducts_exactly_the_ordered_quantity(self):
+        response = self.patch_status(self.order, Order.Status.CONFIRMED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+        self.assertEqual(self.stock(), 8)
+
+    def test_insufficient_stock_blocks_confirmation(self):
+        self.product.stock_quantity = 1
+        self.product.save(update_fields=["stock_quantity"])
+
+        response = self.patch_status(self.order, Order.Status.CONFIRMED)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("status", response.data)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.PENDING)
+        self.assertEqual(self.stock(), 1)
+
+    def test_confirmation_uses_the_quantity_of_the_same_request(self):
+        response = self.client.patch(
+            self.detail(self.order),
+            {"quantity": 4, "status": Order.Status.CONFIRMED},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.quantity, 4)
+        self.assertEqual(self.stock(), 6)
+
+    def test_repeating_confirmed_does_not_deduct_twice(self):
+        self.patch_status(self.order, Order.Status.CONFIRMED)
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, Order.Status.CONFIRMED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+        self.assertEqual(self.stock(), 8)
+
+    def test_patch_without_status_change_keeps_stock(self):
+        self.reach(Order.Status.CONFIRMED)
+        before = self.stock()
+
+        response = self.client.patch(
+            self.detail(self.order), {"customer_name": "Nouveau nom"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), before)
+
+    # --- création ---------------------------------------------------------
+    def test_creation_in_pending_does_not_touch_stock(self):
+        response = self.create_order()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.stock(), 10)
+
+    def test_creation_in_refused_is_allowed_without_stock_movement(self):
+        response = self.create_order(status=Order.Status.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["status"], Order.Status.REFUSED)
+        self.assertEqual(self.stock(), 10)
+
+    def test_creation_in_controlled_statuses_is_refused(self):
+        controlled = (
+            Order.Status.CONFIRMED,
+            Order.Status.SHIPPED,
+            Order.Status.DELIVERED,
+            Order.Status.RETURNED,
+        )
+
+        for index, value in enumerate(controlled):
+            order_number = f"CMD-DIRECT-{index}"
+            response = self.create_order(order_number=order_number, status=value)
+
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_400_BAD_REQUEST,
+                msg=f"Création acceptée à tort : {value}",
+            )
+            self.assertFalse(Order.objects.filter(order_number=order_number).exists())
+
+        self.assertEqual(self.stock(), 10)
+
+    # --- transitions autorisées / interdites ------------------------------
+    def test_allowed_transitions_are_accepted(self):
+        cases = (
+            (Order.Status.PENDING, Order.Status.CONFIRMED),
+            (Order.Status.PENDING, Order.Status.REFUSED),
+            (Order.Status.CONFIRMED, Order.Status.SHIPPED),
+            (Order.Status.CONFIRMED, Order.Status.REFUSED),
+            (Order.Status.SHIPPED, Order.Status.DELIVERED),
+            (Order.Status.SHIPPED, Order.Status.REFUSED),
+            (Order.Status.SHIPPED, Order.Status.RETURNED),
+            (Order.Status.DELIVERED, Order.Status.RETURNED),
+        )
+        self.product.stock_quantity = 100
+        self.product.save(update_fields=["stock_quantity"])
+
+        for index, (start, target) in enumerate(cases):
+            with self.subTest(transition=f"{start} -> {target}"):
+                response = self.create_order(order_number=f"CMD-OK-{index}")
+                order = Order.objects.get(pk=response.data["id"])
+                self.reach(start, order=order)
+
+                result = self.patch_status(order, target)
+
+                self.assertEqual(result.status_code, status.HTTP_200_OK)
+                order.refresh_from_db()
+                self.assertEqual(order.status, target)
+
+    def test_forbidden_transitions_are_refused(self):
+        cases = [
+            (Order.Status.PENDING, Order.Status.SHIPPED),
+            (Order.Status.PENDING, Order.Status.DELIVERED),
+            (Order.Status.PENDING, Order.Status.RETURNED),
+            (Order.Status.CONFIRMED, Order.Status.PENDING),
+            (Order.Status.CONFIRMED, Order.Status.DELIVERED),
+            (Order.Status.CONFIRMED, Order.Status.RETURNED),
+            (Order.Status.SHIPPED, Order.Status.PENDING),
+            (Order.Status.SHIPPED, Order.Status.CONFIRMED),
+            (Order.Status.DELIVERED, Order.Status.PENDING),
+            (Order.Status.DELIVERED, Order.Status.CONFIRMED),
+            (Order.Status.DELIVERED, Order.Status.SHIPPED),
+            (Order.Status.DELIVERED, Order.Status.REFUSED),
+            (Order.Status.REFUSED, Order.Status.PENDING),
+            (Order.Status.REFUSED, Order.Status.CONFIRMED),
+            (Order.Status.REFUSED, Order.Status.RETURNED),
+            (Order.Status.RETURNED, Order.Status.PENDING),
+            (Order.Status.RETURNED, Order.Status.DELIVERED),
+            (Order.Status.RETURNED, Order.Status.REFUSED),
+        ]
+        self.product.stock_quantity = 100
+        self.product.save(update_fields=["stock_quantity"])
+
+        for start, target in cases:
+            with self.subTest(transition=f"{start}->{target}"):
+                created = self.create_order(order_number=f"CMD-NO-{start}-{target}")
+                order = Order.objects.get(pk=created.data["id"])
+                self.reach(start, order=order)
+
+                self.assertTransitionRefused(order, target)
+
+    def test_terminal_statuses_cannot_be_left(self):
+        targets = (
+            Order.Status.PENDING,
+            Order.Status.CONFIRMED,
+            Order.Status.SHIPPED,
+            Order.Status.DELIVERED,
+            Order.Status.REFUSED,
+            Order.Status.RETURNED,
+        )
+
+        for index, terminal in enumerate(
+            (Order.Status.REFUSED, Order.Status.RETURNED)
+        ):
+            with self.subTest(terminal=terminal):
+                created = self.create_order(order_number=f"CMD-TERM-{index}")
+                order = Order.objects.get(pk=created.data["id"])
+                self.reach(terminal, order=order)
+
+                for target in targets:
+                    if target == terminal:
+                        continue
+                    self.assertTransitionRefused(order, target)
+
+    # --- refus et retours -------------------------------------------------
+    def test_pending_to_refused_does_not_touch_stock(self):
+        response = self.patch_status(self.order, Order.Status.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.REFUSED)
+        self.assertEqual(self.stock(), 10)
+
+    def test_confirmed_to_refused_restores_stock_once(self):
+        self.reach(Order.Status.CONFIRMED)
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, Order.Status.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+
+        repeat = self.patch_status(self.order, Order.Status.REFUSED)
+
+        self.assertEqual(repeat.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+
+    def test_shipped_to_refused_restores_stock_once(self):
+        self.reach(Order.Status.SHIPPED)
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, Order.Status.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+
+    def test_shipped_to_returned_restores_stock_once(self):
+        self.reach(Order.Status.SHIPPED)
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, Order.Status.RETURNED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+
+        repeat = self.patch_status(self.order, Order.Status.RETURNED)
+
+        self.assertEqual(repeat.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+
+    def test_delivered_to_returned_restores_stock_once(self):
+        self.reach(Order.Status.DELIVERED)
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, Order.Status.RETURNED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+
+    # --- intégrité (quantité / produit) -----------------------------------
+    def test_quantity_change_is_refused_after_confirmation(self):
+        self.reach(Order.Status.CONFIRMED)
+
+        response = self.client.patch(self.detail(self.order), {"quantity": 5})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("quantity", response.data)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.quantity, 2)
+        self.assertEqual(self.stock(), 8)
+
+    def test_product_change_is_refused_after_confirmation(self):
+        other = Product.objects.create(
+            name="Produit alternatif",
+            purchase_price="100.00",
+            selling_price="200.00",
+            stock_quantity=7,
+        )
+        self.reach(Order.Status.SHIPPED)
+
+        response = self.client.patch(self.detail(self.order), {"product": other.pk})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("product", response.data)
+        self.order.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(self.order.product_id, self.product.id)
+        self.assertEqual(self.stock(), 8)
+        self.assertEqual(other.stock_quantity, 7)
+
+    def test_quantity_and_product_changes_are_allowed_while_pending(self):
+        other = Product.objects.create(
+            name="Produit alternatif",
+            purchase_price="100.00",
+            selling_price="200.00",
+            stock_quantity=7,
+        )
+
+        response = self.client.patch(
+            self.detail(self.order),
+            {"quantity": 4, "product": other.id},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.quantity, 4)
+        self.assertEqual(self.order.product_id, other.id)
+        self.assertEqual(self.stock(), 10)
+        other.refresh_from_db()
+        self.assertEqual(other.stock_quantity, 7)
+
+    # --- suppression ------------------------------------------------------
+    def test_order_deletion_is_refused_while_stock_is_deducted(self):
+        for index, target in enumerate(
+            (
+                Order.Status.CONFIRMED,
+                Order.Status.SHIPPED,
+                Order.Status.DELIVERED,
+            )
+        ):
+            with self.subTest(status=target):
+                created = self.create_order(order_number=f"CMD-DEL-{index}")
+                order = Order.objects.get(pk=created.data["id"])
+                self.reach(target, order=order)
+                before_stock = self.stock()
+
+                response = self.client.delete(self.detail(order))
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn("status", response.data)
+                self.assertTrue(Order.objects.filter(pk=order.pk).exists())
+                self.assertEqual(self.stock(), before_stock)
+
+    def test_returned_order_deletion_is_refused(self):
+        self.reach(Order.Status.RETURNED)
+
+        response = self.client.delete(self.detail(self.order))
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(Order.objects.filter(pk=self.order.pk).exists())
+        self.assertEqual(self.stock(), 10)
+
+    def test_pending_order_deletion_is_allowed_without_stock_change(self):
+        response = self.client.delete(self.detail(self.order))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Order.objects.filter(pk=self.order.pk).exists())
+        self.assertEqual(self.stock(), 10)
+
+    def test_refused_order_deletion_is_allowed_without_stock_change(self):
+        self.reach(Order.Status.REFUSED)
+
+        response = self.client.delete(self.detail(self.order))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(self.stock(), 10)
+
+    # --- atomicité / modifications partielles -----------------------------
+    def test_failed_confirmation_leaves_no_partial_change(self):
+        self.product.stock_quantity = 1
+        self.product.save(update_fields=["stock_quantity"])
+
+        response = self.client.patch(
+            self.detail(self.order),
+            {"status": Order.Status.CONFIRMED, "customer_name": "Nom partiel"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.PENDING)
+        self.assertEqual(self.order.customer_name, "Client de test")
+        self.assertEqual(self.stock(), 1)
+
+    def test_failed_transition_leaves_no_partial_change(self):
+        self.reach(Order.Status.CONFIRMED)
+
+        response = self.client.patch(
+            self.detail(self.order),
+            {"status": Order.Status.PENDING, "notes": "note partielle"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+        self.assertEqual(self.order.notes, "")
+        self.assertEqual(self.stock(), 8)
+
+    # --- données existantes (antérieures à la fonctionnalité) -------------
+    def test_legacy_order_without_status_change_does_not_move_stock(self):
+        legacy = Order.objects.create(
+            order_number="CMD-LEGACY-1",
+            customer_name="Ancienne commande",
+            product=self.product,
+            quantity=2,
+            unit_price="1500.00",
+            status=Order.Status.CONFIRMED,
+        )
+
+        response = self.client.patch(
+            self.detail(legacy), {"customer_name": "Renommée"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        legacy.refresh_from_db()
+        self.assertEqual(legacy.status, Order.Status.CONFIRMED)
+        self.assertEqual(legacy.customer_name, "Renommée")
+        self.assertEqual(self.stock(), 10)
+
+    def test_legacy_confirmed_order_refused_restores_stock_per_transition(self):
+        # Comportement assumé : la restitution dépend de la transition réelle
+        # (confirmed → refused), même pour une commande historique dont le
+        # stock n'avait jamais été décrémenté.
+        legacy = Order.objects.create(
+            order_number="CMD-LEGACY-2",
+            customer_name="Ancienne commande",
+            product=self.product,
+            quantity=2,
+            unit_price="1500.00",
+            status=Order.Status.CONFIRMED,
+        )
+
+        response = self.patch_status(legacy, Order.Status.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        legacy.refresh_from_db()
+        self.assertEqual(legacy.status, Order.Status.REFUSED)
+        self.assertEqual(self.stock(), 12)
+
+    # --- mises à jour complètes (PUT) -------------------------------------
+    def test_full_put_without_status_change_does_not_deduct_twice(self):
+        self.reach(Order.Status.CONFIRMED)
+
+        response = self.client.put(self.detail(self.order), self.put_payload(self.order))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+        self.assertEqual(self.stock(), 8)
+
+    def test_full_put_can_confirm_a_pending_order(self):
+        response = self.client.put(
+            self.detail(self.order),
+            self.put_payload(self.order, status=Order.Status.CONFIRMED),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.CONFIRMED)
+        self.assertEqual(self.stock(), 8)
+
+    def test_full_put_omitting_status_keeps_the_current_status(self):
+        # DRF ne recopie pas les valeurs par défaut du modèle dans les champs
+        # du serializer : un PUT qui omet `status` ne réinitialise donc pas la
+        # commande à 'pending' et ne provoque aucun mouvement de stock.
+        self.reach(Order.Status.DELIVERED)
+
+        payload = self.put_payload(self.order)
+        payload.pop("status")
+
+        response = self.client.put(self.detail(self.order), payload)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.DELIVERED)
+        self.assertEqual(self.stock(), 8)
+
+    # --- authentification -------------------------------------------------
+    def test_anonymous_transition_is_refused(self):
+        self.client.credentials()
+
+        response = self.patch_status(self.order, Order.Status.CONFIRMED)
+
+        self.assertRefused(response)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.PENDING)
+        self.assertEqual(self.stock(), 10)
