@@ -97,6 +97,14 @@ class Order(models.Model):
         default=Status.PENDING,
         verbose_name="Statut",
     )
+    stock_deducted = models.BooleanField(
+        default=False,
+        verbose_name="Stock déduit",
+        help_text=(
+            "Vrai lorsque la quantité de cette commande a été effectivement "
+            "déduite du stock et n'a pas encore été restituée."
+        ),
+    )
     notes = models.TextField(
         blank=True,
         verbose_name="Notes",

@@ -1,6 +1,9 @@
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TransactionTestCase
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.authtoken.models import Token
@@ -810,7 +813,7 @@ class OrderStockTransitionTests(SecuredApiTestCase):
             "order_number": order.order_number,
             "customer_name": order.customer_name,
             "customer_phone": order.customer_phone,
-            "product": order.product_id,
+            "product": order.product.id,
             "quantity": order.quantity,
             "unit_price": str(order.unit_price),
             "delivery_cost": str(order.delivery_cost),
@@ -819,6 +822,21 @@ class OrderStockTransitionTests(SecuredApiTestCase):
         }
         payload.update(overrides)
         return payload
+
+    def legacy_order(self, order_status, *, quantity=2, number="CMD-LEGACY-0"):
+        """Commande historique : créée sans passer par l'API, marqueur à False."""
+        return Order.objects.create(
+            order_number=number,
+            customer_name="Ancienne commande",
+            product=self.product,
+            quantity=quantity,
+            unit_price="1500.00",
+            status=order_status,
+        )
+
+    def deducted(self, order):
+        order.refresh_from_db()
+        return order.stock_deducted
 
     # --- confirmation -----------------------------------------------------
     def test_confirmation_deducts_exactly_the_ordered_quantity(self):
@@ -1174,16 +1192,10 @@ class OrderStockTransitionTests(SecuredApiTestCase):
         self.assertEqual(self.order.notes, "")
         self.assertEqual(self.stock(), 8)
 
-    # --- données existantes (antérieures à la fonctionnalité) -------------
+    # --- commandes historiques (marqueur de stock à False) ----------------
     def test_legacy_order_without_status_change_does_not_move_stock(self):
-        legacy = Order.objects.create(
-            order_number="CMD-LEGACY-1",
-            customer_name="Ancienne commande",
-            product=self.product,
-            quantity=2,
-            unit_price="1500.00",
-            status=Order.Status.CONFIRMED,
-        )
+        legacy = self.legacy_order(self.CONFIRMED)
+        self.assertFalse(self.deducted(legacy))
 
         response = self.client.patch(
             self.detail(legacy), {"customer_name": "Renommée"}
@@ -1191,29 +1203,165 @@ class OrderStockTransitionTests(SecuredApiTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         legacy.refresh_from_db()
-        self.assertEqual(legacy.status, Order.Status.CONFIRMED)
+        self.assertEqual(legacy.status, self.CONFIRMED)
         self.assertEqual(legacy.customer_name, "Renommée")
         self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(legacy))
 
-    def test_legacy_confirmed_order_refused_restores_stock_per_transition(self):
-        # Comportement assumé : la restitution dépend de la transition réelle
-        # (confirmed → refused), même pour une commande historique dont le
-        # stock n'avait jamais été décrémenté.
-        legacy = Order.objects.create(
-            order_number="CMD-LEGACY-2",
-            customer_name="Ancienne commande",
-            product=self.product,
-            quantity=2,
-            unit_price="1500.00",
-            status=Order.Status.CONFIRMED,
-        )
+    def test_legacy_confirmed_order_refused_does_not_restore_stock(self):
+        # Marqueur à False : le statut est 'confirmed' mais le stock n'a jamais
+        # été déduit ; refuser la commande ne doit donc rien restituer.
+        legacy = self.legacy_order(self.CONFIRMED)
 
-        response = self.patch_status(legacy, Order.Status.REFUSED)
+        response = self.patch_status(legacy, self.REFUSED)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         legacy.refresh_from_db()
-        self.assertEqual(legacy.status, Order.Status.REFUSED)
-        self.assertEqual(self.stock(), 12)
+        self.assertEqual(legacy.status, self.REFUSED)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(legacy))
+
+    def test_legacy_shipped_order_refused_does_not_restore_stock(self):
+        legacy = self.legacy_order(self.SHIPPED)
+
+        response = self.patch_status(legacy, self.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        legacy.refresh_from_db()
+        self.assertEqual(legacy.status, self.REFUSED)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(legacy))
+
+    def test_legacy_shipped_order_returned_does_not_restore_stock(self):
+        legacy = self.legacy_order(self.SHIPPED)
+
+        response = self.patch_status(legacy, self.RETURNED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        legacy.refresh_from_db()
+        self.assertEqual(legacy.status, self.RETURNED)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(legacy))
+
+    def test_legacy_delivered_order_returned_does_not_restore_stock(self):
+        legacy = self.legacy_order(self.DELIVERED)
+
+        response = self.patch_status(legacy, self.RETURNED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        legacy.refresh_from_db()
+        self.assertEqual(legacy.status, self.RETURNED)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(legacy))
+
+    # --- traçabilité persistante du stock ---------------------------------
+    def test_new_confirmation_sets_the_deducted_marker(self):
+        response = self.patch_status(self.order, self.CONFIRMED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 8)
+        self.assertTrue(self.deducted(self.order))
+
+    def test_confirmation_then_refusal_restores_and_clears_the_marker(self):
+        self.reach(self.CONFIRMED)
+        self.assertTrue(self.deducted(self.order))
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, self.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_shipped_after_confirmation_then_returned_restores_exactly(self):
+        self.reach(self.SHIPPED)
+        self.assertTrue(self.deducted(self.order))
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, self.RETURNED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_delivered_after_confirmation_then_returned_restores_exactly(self):
+        self.reach(self.DELIVERED)
+        self.assertTrue(self.deducted(self.order))
+        self.assertEqual(self.stock(), 8)
+
+        response = self.patch_status(self.order, self.RETURNED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_restoration_cannot_happen_twice(self):
+        self.reach(self.CONFIRMED)
+        self.patch_status(self.order, self.REFUSED)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(self.order))
+
+        # Statut ramené de force à un état antérieur, marqueur toujours à
+        # False : une nouvelle transition vers 'refused' ne restitue rien.
+        Order.objects.filter(pk=self.order.pk).update(status=self.CONFIRMED)
+
+        response = self.patch_status(self.order, self.REFUSED)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_insufficient_stock_leaves_the_marker_untouched(self):
+        self.product.stock_quantity = 1
+        self.product.save(update_fields=["stock_quantity"])
+
+        response = self.patch_status(self.order, self.CONFIRMED)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, self.PENDING)
+        self.assertEqual(self.stock(), 1)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_failed_validation_rolls_back_the_marker(self):
+        # La quantité demandée dépasse le stock : la confirmation échoue et ni
+        # le stock, ni le statut, ni le marqueur ne doivent changer.
+        response = self.client.patch(
+            self.detail(self.order),
+            {"quantity": 50, "status": self.CONFIRMED},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, self.PENDING)
+        self.assertEqual(self.order.quantity, 2)
+        self.assertEqual(self.stock(), 10)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_creation_starts_with_the_marker_disabled(self):
+        response = self.create_order()
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["stock_deducted"])
+        self.assertFalse(self.deducted(Order.objects.get(pk=response.data["id"])))
+
+    def test_marker_is_read_only_for_clients(self):
+        response = self.client.patch(
+            self.detail(self.order), {"stock_deducted": True}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(self.deducted(self.order))
+
+    def test_full_put_confirming_sets_the_marker(self):
+        response = self.client.put(
+            self.detail(self.order),
+            self.put_payload(self.order, status=self.CONFIRMED),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.stock(), 8)
+        self.assertTrue(self.deducted(self.order))
 
     # --- mises à jour complètes (PUT) -------------------------------------
     def test_full_put_without_status_change_does_not_deduct_twice(self):
@@ -1263,3 +1411,63 @@ class OrderStockTransitionTests(SecuredApiTestCase):
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, Order.Status.PENDING)
         self.assertEqual(self.stock(), 10)
+
+
+class OrderStockDeductedMigrationTests(TransactionTestCase):
+    """Migration 0002 : le marqueur des lignes existantes passe à False.
+
+    La migration ne doit ni changer les statuts, quantités, prix ou produits,
+    ni toucher au stock : elle ajoute uniquement la colonne ``stock_deducted``
+    avec la valeur ``False`` sur les enregistrements déjà présents.
+    """
+
+    def test_existing_rows_receive_false_without_other_changes(self):
+        executor = MigrationExecutor(connection)
+        order_pk = None
+        product_pk = None
+        try:
+            executor.migrate([("api", "0001_initial")])
+            old_apps = executor.loader.project_state(
+                [("api", "0001_initial")]
+            ).apps
+            OldProduct = old_apps.get_model("api", "Product")
+            OldOrder = old_apps.get_model("api", "Order")
+
+            product = OldProduct.objects.create(
+                name="Produit historique",
+                purchase_price="1000.00",
+                selling_price="1500.00",
+                stock_quantity=5,
+            )
+            order = OldOrder.objects.create(
+                order_number="CMD-MIGRATION-1",
+                customer_name="Client historique",
+                product=product,
+                quantity=3,
+                unit_price="1500.00",
+                delivery_cost="0.00",
+                status="confirmed",
+                notes="note historique",
+            )
+            order_pk = order.pk
+            product_pk = product.pk
+        finally:
+            executor = MigrationExecutor(connection)
+            executor.migrate([("api", "0002_order_stock_deducted")])
+
+        new_apps = executor.loader.project_state(
+            [("api", "0002_order_stock_deducted")]
+        ).apps
+        NewOrder = new_apps.get_model("api", "Order")
+        NewProduct = new_apps.get_model("api", "Product")
+
+        migrated_order = NewOrder.objects.get(pk=order_pk)
+        self.assertFalse(migrated_order.stock_deducted)
+        self.assertEqual(migrated_order.status, "confirmed")
+        self.assertEqual(migrated_order.quantity, 3)
+        self.assertEqual(str(migrated_order.unit_price), "1500.00")
+        self.assertEqual(migrated_order.product_id, product_pk)
+        self.assertEqual(migrated_order.notes, "note historique")
+
+        migrated_product = NewProduct.objects.get(pk=product_pk)
+        self.assertEqual(migrated_product.stock_quantity, 5)

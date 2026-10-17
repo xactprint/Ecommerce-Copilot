@@ -71,11 +71,12 @@ ORDER_TRANSITIONS = {
 }
 
 # Statuts pour lesquels le stock a déjà été décrémenté.
-ORDER_STOCK_DEDUCTED = (
-    Order.Status.CONFIRMED,
-    Order.Status.SHIPPED,
-    Order.Status.DELIVERED,
-)
+#
+# Le marqueur persistant ``Order.stock_deducted`` est la seule preuve qu'une
+# décrémentation a réellement eu lieu : le statut seul ne suffit pas, car des
+# commandes historiques peuvent être ``confirmed``/``shipped``/``delivered``
+# sans que leur stock ait jamais été déduit. Aucune restitution ne doit donc
+# se fonder sur le statut sans vérifier ce marqueur.
 
 # Statuts acceptés à la création : les autres s'obtiennent par transition.
 ORDER_CREATABLE_STATUSES = {Order.Status.PENDING, Order.Status.REFUSED}
@@ -117,7 +118,7 @@ def _lock_order_row(order_id: int):
 
     return (
         queryset.filter(pk=order_id)
-        .values("status", "quantity", "product_id")
+        .values("status", "quantity", "product_id", "stock_deducted")
         .first()
     )
 
@@ -212,6 +213,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             current_status = current["status"]
             current_quantity = current["quantity"]
             current_product_id = current["product_id"]
+            current_deducted = current["stock_deducted"]
 
             if new_status != current_status:
                 allowed = ORDER_TRANSITIONS.get(current_status, set())
@@ -237,23 +239,26 @@ class OrderViewSet(viewsets.ModelViewSet):
 
             _lock_products_for_update({current_product_id, new_product.pk})
 
+            # Le marqueur de traçabilité suit exactement les mouvements
+            # réellement effectués : il n'est jamais déduit du seul statut.
+            new_deducted = current_deducted
+
             if current_status == Order.Status.PENDING and (
                 new_status == Order.Status.CONFIRMED
             ):
-                _deduct_stock(new_product.pk, new_quantity)
+                if not current_deducted:
+                    _deduct_stock(new_product.pk, new_quantity)
+                    new_deducted = True
 
-            elif new_status == Order.Status.REFUSED and current_status in (
-                Order.Status.CONFIRMED,
-                Order.Status.SHIPPED,
-            ):
-                _restore_stock(current_product_id, current_quantity)
+            elif new_status in (Order.Status.REFUSED, Order.Status.RETURNED):
+                # Restitution uniquement si le stock avait réellement été
+                # déduit ; une commande historique (marqueur à False) ne
+                # restitue donc jamais rien.
+                if current_deducted:
+                    _restore_stock(current_product_id, current_quantity)
+                    new_deducted = False
 
-            elif new_status == Order.Status.RETURNED and current_status in (
-                Order.Status.SHIPPED,
-                Order.Status.DELIVERED,
-            ):
-                _restore_stock(current_product_id, current_quantity)
-
+            order.stock_deducted = new_deducted
             serializer.save()
 
     def perform_destroy(self, instance):
