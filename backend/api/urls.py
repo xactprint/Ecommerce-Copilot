@@ -3,7 +3,13 @@ from django.urls import path, include
 from rest_framework.authtoken.views import obtain_auth_token
 from rest_framework.routers import DefaultRouter
 
-from .views import dashboard, logout, ProductViewSet, OrderViewSet
+from .views import (
+    dashboard,
+    logout,
+    negative_orders,
+    ProductViewSet,
+    OrderViewSet,
+)
 
 
 router = DefaultRouter()
@@ -16,5 +22,10 @@ urlpatterns = [
     path("token/", obtain_auth_token, name="api-token-auth"),
     path("logout/", logout, name="api-logout"),
     path("dashboard/", dashboard, name="dashboard"),
+    path(
+        "analytics/negative-orders/",
+        negative_orders,
+        name="analytics-negative-orders",
+    ),
     path("", include(router.urls)),
 ]

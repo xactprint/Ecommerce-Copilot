@@ -1943,3 +1943,398 @@ class OrderCostsEstimatedMigrationTests(TransactionTestCase):
         )
 
         self.assertFalse(order.costs_estimated)
+
+
+class NegativeOrderAnalyticsTests(SecuredApiTestCase):
+    """Endpoint read-only des commandes livrées à résultat net négatif.
+
+    Fixture de base : produit (achat 1000, vente 1500) et commande
+    « CMD-TEST-1 » en attente (quantité 2, prix 1500, achat 1000).
+    """
+
+    RESULT_KEYS = {
+        "id",
+        "orderNumber",
+        "productId",
+        "productName",
+        "quantity",
+        "revenue",
+        "purchase",
+        "packaging",
+        "delivery",
+        "netResult",
+        "marginRate",
+        "costsEstimated",
+        "createdAt",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.authenticate()
+        self.url = reverse("analytics-negative-orders")
+
+    def create_order(
+        self,
+        order_number,
+        *,
+        status=Order.Status.DELIVERED,
+        quantity=1,
+        unit_price="100.00",
+        purchase_price="80.00",
+        packaging_cost="0.00",
+        delivery_cost="0.00",
+        costs_estimated=False,
+    ):
+        return Order.objects.create(
+            order_number=order_number,
+            customer_name="Client confidentiel",
+            customer_phone="0555000000",
+            product=self.product,
+            quantity=quantity,
+            unit_price=unit_price,
+            purchase_price=purchase_price,
+            packaging_cost=packaging_cost,
+            delivery_cost=delivery_cost,
+            status=status,
+            costs_estimated=costs_estimated,
+        )
+
+    def get_negative_orders(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        return response.data
+
+    # --- authentification -------------------------------------------------
+    def test_anonymous_access_is_refused(self):
+        self.client.credentials()
+
+        self.assertRefused(self.client.get(self.url))
+
+    def test_authenticated_access_returns_the_expected_contract(self):
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["currency"], "DZD")
+        self.assertIn("generatedAt", data)
+        self.assertEqual(data["scope"]["status"], "delivered")
+        self.assertEqual(data["scope"]["costBasis"], "order_snapshots")
+        self.assertEqual(data["scope"]["rule"], "net_result_after_delivery < 0")
+        self.assertEqual(data["limit"], 20)
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["results"], [])
+
+    # --- inclusion / exclusion -------------------------------------------
+    def test_delivered_order_with_positive_result_is_excluded(self):
+        self.order.status = Order.Status.DELIVERED
+        self.order.save(update_fields=["status"])
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["summary"]["deliveredOrders"], 1)
+
+    def test_delivered_order_with_zero_result_is_excluded(self):
+        self.create_order(
+            "CMD-ZERO",
+            unit_price="100.00",
+            purchase_price="80.00",
+            delivery_cost="20.00",
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["results"], [])
+
+    def test_delivered_order_with_negative_result_is_included(self):
+        self.create_order(
+            "CMD-NEGATIVE",
+            quantity=2,
+            unit_price="120.00",
+            purchase_price="85.00",
+            packaging_cost="5.00",
+            delivery_cost="80.00",
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 1)
+        result = data["results"][0]
+        self.assertEqual(result["orderNumber"], "CMD-NEGATIVE")
+        self.assertEqual(result["revenue"], "240.00")
+        self.assertEqual(result["purchase"], "170.00")
+        self.assertEqual(result["packaging"], "10.00")
+        self.assertEqual(result["delivery"], "80.00")
+        self.assertEqual(result["netResult"], "-20.00")
+        self.assertEqual(result["marginRate"], "-8.33")
+
+    def test_non_delivered_orders_are_excluded_even_if_negative(self):
+        for index, order_status in enumerate(
+            (
+                Order.Status.PENDING,
+                Order.Status.CONFIRMED,
+                Order.Status.SHIPPED,
+                Order.Status.REFUSED,
+                Order.Status.RETURNED,
+            )
+        ):
+            self.create_order(
+                f"CMD-NOT-DELIVERED-{index}",
+                status=order_status,
+                unit_price="10.00",
+                purchase_price="20.00",
+            )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["summary"]["deliveredOrders"], 0)
+        self.assertEqual(data["results"], [])
+
+    # --- snapshots et coûts ----------------------------------------------
+    def test_calculation_uses_order_snapshots_after_product_change(self):
+        self.create_order(
+            "CMD-SNAPSHOT",
+            quantity=2,
+            unit_price="120.00",
+            purchase_price="85.00",
+            packaging_cost="5.00",
+            delivery_cost="80.00",
+        )
+        before = self.get_negative_orders()["results"][0]
+
+        self.product.purchase_price = "1.00"
+        self.product.packaging_cost = "999.00"
+        self.product.save(update_fields=["purchase_price", "packaging_cost"])
+
+        after = self.get_negative_orders()["results"][0]
+
+        self.assertEqual(before, after)
+        self.assertEqual(after["purchase"], "170.00")
+        self.assertEqual(after["packaging"], "10.00")
+        self.assertEqual(after["netResult"], "-20.00")
+
+    def test_estimated_costs_are_flagged_and_aggregated_separately(self):
+        self.create_order(
+            "CMD-CAPTURED",
+            unit_price="100.00",
+            purchase_price="110.00",
+            costs_estimated=False,
+        )
+        self.create_order(
+            "CMD-ESTIMATED",
+            unit_price="100.00",
+            purchase_price="120.00",
+            costs_estimated=True,
+        )
+        self.create_order(
+            "CMD-ESTIMATED-POSITIVE",
+            unit_price="100.00",
+            purchase_price="10.00",
+            costs_estimated=True,
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["summary"]["deliveredOrders"], 3)
+        self.assertEqual(data["summary"]["negativeOrders"], 2)
+        self.assertEqual(
+            data["summary"]["negativeOrdersWithCapturedCosts"], 1
+        )
+        self.assertEqual(
+            data["summary"]["negativeOrdersWithEstimatedCosts"], 1
+        )
+        self.assertEqual(data["summary"]["negativeNetTotal"], "-30.00")
+        self.assertEqual(
+            data["summary"]["negativeNetTotalCaptured"], "-10.00"
+        )
+        self.assertEqual(
+            data["summary"]["negativeNetTotalEstimated"], "-20.00"
+        )
+        self.assertTrue(data["dataQuality"]["estimated"])
+        self.assertEqual(data["dataQuality"]["estimatedOrders"], 1)
+        self.assertEqual(
+            data["dataQuality"]["warnings"],
+            ["estimated_costs", "financial_fields_mutable"],
+        )
+
+        by_number = {
+            result["orderNumber"]: result for result in data["results"]
+        }
+        self.assertFalse(by_number["CMD-CAPTURED"]["costsEstimated"])
+        self.assertTrue(by_number["CMD-ESTIMATED"]["costsEstimated"])
+
+    def test_estimated_positive_order_does_not_flag_the_aggregate(self):
+        self.create_order(
+            "CMD-ESTIMATED-POSITIVE-ONLY",
+            unit_price="100.00",
+            purchase_price="10.00",
+            costs_estimated=True,
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertFalse(data["dataQuality"]["estimated"])
+        self.assertEqual(data["dataQuality"]["estimatedOrders"], 0)
+        self.assertEqual(
+            data["dataQuality"]["warnings"],
+            ["financial_fields_mutable"],
+        )
+
+    def test_high_delivery_cost_is_taken_into_account(self):
+        self.create_order(
+            "CMD-HIGH-DELIVERY",
+            unit_price="100.00",
+            purchase_price="80.00",
+            delivery_cost="50.00",
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 1)
+        result = data["results"][0]
+        self.assertEqual(result["delivery"], "50.00")
+        self.assertEqual(result["netResult"], "-30.00")
+
+    def test_margin_rate_is_null_when_revenue_is_zero(self):
+        self.create_order(
+            "CMD-NO-REVENUE",
+            unit_price="0.00",
+            purchase_price="10.00",
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 1)
+        result = data["results"][0]
+        self.assertEqual(result["revenue"], "0.00")
+        self.assertEqual(result["netResult"], "-10.00")
+        self.assertIsNone(result["marginRate"])
+
+    # --- tri, limite et comptage ------------------------------------------
+    def test_results_are_sorted_and_count_precedes_limit(self):
+        self.create_order(
+            "CMD-NET-10",
+            unit_price="100.00",
+            purchase_price="110.00",
+        )
+        self.create_order(
+            "CMD-NET-30",
+            unit_price="100.00",
+            purchase_price="130.00",
+        )
+        self.create_order(
+            "CMD-NET-20",
+            unit_price="100.00",
+            purchase_price="120.00",
+        )
+        self.create_order(
+            "CMD-POSITIVE",
+            unit_price="100.00",
+            purchase_price="90.00",
+        )
+
+        data = self.get_negative_orders(limit=2)
+
+        self.assertEqual(data["count"], 3)
+        self.assertEqual(data["limit"], 2)
+        self.assertEqual(len(data["results"]), 2)
+        self.assertEqual(
+            [result["netResult"] for result in data["results"]],
+            ["-30.00", "-20.00"],
+        )
+        self.assertLessEqual(Decimal(data["summary"]["negativeNetTotal"]), 0)
+
+    def test_invalid_limit_is_refused(self):
+        for value in ("0", "101", "abc", "1.5"):
+            with self.subTest(limit=value):
+                response = self.client.get(self.url, {"limit": value})
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_400_BAD_REQUEST,
+                )
+                self.assertIn("limit", response.data)
+
+    def test_empty_database_returns_an_empty_result(self):
+        Order.objects.all().delete()
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["summary"]["deliveredOrders"], 0)
+        self.assertEqual(data["summary"]["negativeNetTotal"], "0.00")
+        self.assertEqual(data["results"], [])
+
+    # --- protection des données et lecture seule --------------------------
+    def test_payload_exposes_no_customer_personal_data(self):
+        self.create_order(
+            "CMD-PRIVACY",
+            unit_price="100.00",
+            purchase_price="110.00",
+        )
+
+        data = self.get_negative_orders()
+
+        self.assertEqual(len(data["results"]), 1)
+        self.assertEqual(set(data["results"][0]), self.RESULT_KEYS)
+        payload = str(data)
+        self.assertNotIn("Client confidentiel", payload)
+        self.assertNotIn("0555000000", payload)
+
+    def test_call_does_not_modify_orders_products_or_stock(self):
+        self.create_order(
+            "CMD-READ-ONLY",
+            unit_price="100.00",
+            purchase_price="110.00",
+        )
+        order_state = list(
+            Order.objects.order_by("pk").values_list(
+                "pk",
+                "status",
+                "quantity",
+                "unit_price",
+                "purchase_price",
+                "packaging_cost",
+                "delivery_cost",
+                "costs_estimated",
+                "stock_deducted",
+            )
+        )
+        product_state = list(
+            Product.objects.order_by("pk").values_list(
+                "pk",
+                "stock_quantity",
+                "purchase_price",
+                "packaging_cost",
+            )
+        )
+
+        self.get_negative_orders()
+
+        self.assertEqual(
+            list(
+                Order.objects.order_by("pk").values_list(
+                    "pk",
+                    "status",
+                    "quantity",
+                    "unit_price",
+                    "purchase_price",
+                    "packaging_cost",
+                    "delivery_cost",
+                    "costs_estimated",
+                    "stock_deducted",
+                )
+            ),
+            order_state,
+        )
+        self.assertEqual(
+            list(
+                Product.objects.order_by("pk").values_list(
+                    "pk",
+                    "stock_quantity",
+                    "purchase_price",
+                    "packaging_cost",
+                )
+            ),
+            product_state,
+        )

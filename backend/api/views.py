@@ -1,9 +1,8 @@
 
 from datetime import timedelta
-from decimal import Decimal
 
 from django.db import connection, transaction
-from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models import Count, F, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -13,42 +12,22 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from .analytics import negative_orders as negative_orders_analytics
+from .analytics import parse_limit
+from .finance import (
+    CANCELLED_STATUSES,
+    CURRENCY,
+    IN_PROGRESS_STATUSES,
+    ORDER_PACKAGING_COST,
+    ORDER_PURCHASE_COST,
+    ORDER_REVENUE,
+    REALIZED_STATUSES,
+    SALES_SERIES_DAYS,
+    ZERO,
+    money as _money,
+)
 from .models import Product, Order
 from .serializers import ProductSerializer, OrderSerializer
-
-CURRENCY = "DZD"
-
-ZERO = Decimal("0.00")
-
-MONEY_FIELD = DecimalField(max_digits=16, decimal_places=2)
-
-ORDER_REVENUE = ExpressionWrapper(
-    F("quantity") * F("unit_price"),
-    output_field=MONEY_FIELD,
-)
-# Les coûts proviennent des snapshots historiques portés par la commande
-# elle-même : modifier le produit n'affecte plus la rentabilité passée.
-ORDER_PURCHASE_COST = ExpressionWrapper(
-    F("quantity") * F("purchase_price"),
-    output_field=MONEY_FIELD,
-)
-ORDER_PACKAGING_COST = ExpressionWrapper(
-    F("quantity") * F("packaging_cost"),
-    output_field=MONEY_FIELD,
-)
-
-# Ventes réalisées : uniquement les commandes livrées.
-REALIZED_STATUSES = (Order.Status.DELIVERED,)
-# Commandes en cours : ni réalisées, ni annulées.
-IN_PROGRESS_STATUSES = (
-    Order.Status.PENDING,
-    Order.Status.CONFIRMED,
-    Order.Status.SHIPPED,
-)
-# Commandes annulées : refusées ou retournées, jamais comptées comme ventes.
-CANCELLED_STATUSES = (Order.Status.REFUSED, Order.Status.RETURNED)
-
-SALES_SERIES_DAYS = 30
 
 
 # --- Gestion du stock et des transitions de commande ----------------------
@@ -287,15 +266,6 @@ class OrderViewSet(viewsets.ModelViewSet):
         instance.delete()
 
 
-def _money(value) -> str:
-    """Sérialise un montant en chaîne décimale à 2 décimales (aucune valeur inventée)."""
-    if value is None:
-        return str(ZERO)
-    if not isinstance(value, Decimal):
-        value = Decimal(str(value))
-    return str(value.quantize(ZERO))
-
-
 def _empty_totals() -> dict:
     return {
         "orders": 0,
@@ -472,6 +442,19 @@ def dashboard(request):
     }
 
     return Response(data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def negative_orders(request):
+    """Commandes livrées dont le résultat net après livraison est négatif.
+
+    Lecture seule : les coûts sont issus des snapshots de chaque commande et
+    aucun seuil de faible marge n'est appliqué. Les commandes à coûts estimés
+    sont signalées et agrégées séparément des coûts capturés.
+    """
+    limit = parse_limit(request.query_params.get("limit"))
+    return Response(negative_orders_analytics(limit=limit))
 
 
 @api_view(["POST"])
