@@ -14,6 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import Product, Order
+from .permissions import IsStaffOrReadOnly
 from .serializers import ProductSerializer, OrderSerializer
 
 CURRENCY = "DZD"
@@ -163,7 +164,7 @@ def _restore_stock(product_id: int, quantity: int) -> None:
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsStaffOrReadOnly]
 
 
 class OrderViewSet(viewsets.ModelViewSet):
@@ -180,7 +181,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     queryset = Order.objects.select_related("product").all()
     serializer_class = OrderSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsStaffOrReadOnly]
 
     def perform_create(self, serializer):
         requested_status = serializer.validated_data.get(

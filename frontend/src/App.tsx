@@ -113,7 +113,22 @@ type Order = {
 
 type Page = 'dashboard' | 'products' | 'orders'
 
-const API_URL = 'http://127.0.0.1:8000/api'
+const configuredApiUrl = import.meta.env.VITE_API_URL?.trim()
+const configuredBackendUrl = import.meta.env.VITE_BACKEND_URL?.trim()
+
+if (!configuredApiUrl && !import.meta.env.DEV) {
+  throw new Error(
+    'VITE_API_URL doit être défini pour construire ou exécuter le frontend en production.',
+  )
+}
+
+const API_URL = (
+  configuredApiUrl || 'http://127.0.0.1:8000/api'
+).replace(/\/$/, '')
+
+const BACKEND_URL = (
+  configuredBackendUrl || API_URL.replace(/\/api$/, '')
+).replace(/\/$/, '')
 
 const TOKEN_STORAGE_KEY = 'ec_copilot_token'
 
@@ -793,7 +808,7 @@ function App() {
                     : 'Ajoute un produit depuis l’administration Django pour le voir ici.'}
                 </p>
                 <a
-                  href="http://127.0.0.1:8000/admin/"
+                  href={`${BACKEND_URL}/admin/`}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -943,7 +958,7 @@ function App() {
                     : 'Ajoute une commande depuis Django Admin pour la voir ici.'}
                 </p>
                 <a
-                  href="http://127.0.0.1:8000/admin/"
+                  href={`${BACKEND_URL}/admin/`}
                   target="_blank"
                   rel="noreferrer"
                 >

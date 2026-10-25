@@ -1,6 +1,11 @@
+import os
+import secrets
 from decimal import Decimal
+from io import StringIO
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
@@ -23,6 +28,7 @@ class SecuredApiTestCase(APITestCase):
         self.user = User.objects.create_user(
             username="tester",
             password=PASSWORD,
+            is_staff=True,
         )
         self.token = Token.objects.create(user=self.user)
         self.product = Product.objects.create(
@@ -167,6 +173,90 @@ class AuthenticatedAccessTests(SecuredApiTestCase):
 
         detail = reverse("product-detail", args=[response.data["id"]])
         self.assertEqual(self.client.delete(detail).status_code, status.HTTP_204_NO_CONTENT)
+
+
+class ReadOnlyAccountPermissionTests(SecuredApiTestCase):
+    """Un compte non staff consulte les données mais ne peut jamais écrire."""
+
+    def setUp(self):
+        super().setUp()
+        self.reader = User.objects.create_user(
+            username="lecteur-demo",
+            password=PASSWORD,
+            is_staff=False,
+        )
+        self.reader_token = Token.objects.create(user=self.reader)
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Token {self.reader_token.key}"
+        )
+
+    def test_non_staff_can_read_dashboard_products_and_orders(self):
+        self.assertEqual(
+            self.client.get(reverse("dashboard")).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.get(reverse("product-list")).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.get(reverse("order-list")).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_non_staff_cannot_create_or_modify_products(self):
+        payload = {
+            "name": "Produit interdit",
+            "purchase_price": "10.00",
+            "selling_price": "20.00",
+        }
+        self.assertEqual(
+            self.client.post(reverse("product-list"), payload).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        detail = reverse("product-detail", args=[self.product.id])
+        self.assertEqual(
+            self.client.patch(detail, {"name": "Modifié"}).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.delete(detail).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self.assertFalse(Product.objects.filter(name="Produit interdit").exists())
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.name, "Produit de test")
+
+    def test_non_staff_cannot_create_transition_or_delete_orders(self):
+        payload = {
+            "order_number": "CMD-INTERDITE",
+            "customer_name": "Client interdit",
+            "product": self.product.id,
+            "quantity": 1,
+            "unit_price": "1500.00",
+        }
+        self.assertEqual(
+            self.client.post(reverse("order-list"), payload).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        detail = reverse("order-detail", args=[self.order.id])
+        self.assertEqual(
+            self.client.patch(detail, {"status": "delivered"}).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(
+            self.client.delete(detail).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self.assertFalse(
+            Order.objects.filter(order_number="CMD-INTERDITE").exists()
+        )
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.Status.PENDING)
 
 
 class PaginationTests(SecuredApiTestCase):
@@ -1943,3 +2033,87 @@ class OrderCostsEstimatedMigrationTests(TransactionTestCase):
         )
 
         self.assertFalse(order.costs_estimated)
+
+
+class DemoSeedCommandTests(APITestCase):
+    """Le seed de démonstration est idempotent et crée un compte en lecture seule."""
+
+    def setUp(self):
+        super().setUp()
+        self.password = secrets.token_urlsafe(16)
+
+    def run_seed(self):
+        output = StringIO()
+        with patch.dict(
+            os.environ,
+            {
+                "DEMO_USERNAME": "demo-test",
+                "DEMO_PASSWORD": self.password,
+            },
+            clear=False,
+        ):
+            call_command("seed_demo", stdout=output)
+        return output.getvalue()
+
+    def test_seed_creates_synthetic_data_without_personal_information(self):
+        output = self.run_seed()
+
+        demo_user = User.objects.get(username="demo-test")
+        self.assertTrue(demo_user.check_password(self.password))
+        self.assertFalse(demo_user.is_staff)
+        self.assertFalse(demo_user.is_superuser)
+        self.assertNotIn(self.password, output)
+
+        self.assertEqual(Product.objects.count(), 3)
+        self.assertEqual(Order.objects.count(), 12)
+        self.assertFalse(Order.objects.exclude(customer_phone="").exists())
+        self.assertFalse(
+            Order.objects.exclude(
+                notes="Donnée synthétique de démonstration."
+            ).exists()
+        )
+
+    def test_seed_is_idempotent(self):
+        self.run_seed()
+        first_counts = (
+            Product.objects.count(),
+            Order.objects.count(),
+            User.objects.filter(username="demo-test").count(),
+        )
+
+        self.run_seed()
+
+        self.assertEqual(
+            first_counts,
+            (
+                Product.objects.count(),
+                Order.objects.count(),
+                User.objects.filter(username="demo-test").count(),
+            ),
+        )
+
+    def test_demo_account_can_read_but_cannot_write(self):
+        self.run_seed()
+        demo_user = User.objects.get(username="demo-test")
+        token = Token.objects.create(user=demo_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+
+        self.assertEqual(
+            self.client.get(reverse("dashboard")).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.get(reverse("product-list")).status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            self.client.post(
+                reverse("product-list"),
+                {
+                    "name": "Produit interdit",
+                    "purchase_price": "10.00",
+                    "selling_price": "20.00",
+                },
+            ).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
