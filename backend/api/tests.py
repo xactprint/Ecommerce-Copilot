@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
@@ -14,6 +15,10 @@ from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
+from .management.commands.seed_demo import (
+    DEMO_ACCOUNT_GROUP,
+    SYNTHETIC_NOTE,
+)
 from .models import Order, Product
 
 User = get_user_model()
@@ -2042,13 +2047,13 @@ class DemoSeedCommandTests(APITestCase):
         super().setUp()
         self.password = secrets.token_urlsafe(16)
 
-    def run_seed(self):
+    def run_seed(self, password=None):
         output = StringIO()
         with patch.dict(
             os.environ,
             {
                 "DEMO_USERNAME": "demo-test",
-                "DEMO_PASSWORD": self.password,
+                "DEMO_PASSWORD": password or self.password,
             },
             clear=False,
         ):
@@ -2068,9 +2073,7 @@ class DemoSeedCommandTests(APITestCase):
         self.assertEqual(Order.objects.count(), 12)
         self.assertFalse(Order.objects.exclude(customer_phone="").exists())
         self.assertFalse(
-            Order.objects.exclude(
-                notes="Donnée synthétique de démonstration."
-            ).exists()
+            Order.objects.exclude(notes=SYNTHETIC_NOTE).exists()
         )
 
     def test_seed_is_idempotent(self):
@@ -2092,9 +2095,18 @@ class DemoSeedCommandTests(APITestCase):
             ),
         )
 
+        demo_user = User.objects.get(username="demo-test")
+        self.assertTrue(
+            demo_user.groups.filter(name=DEMO_ACCOUNT_GROUP).exists()
+        )
+
     def test_demo_account_can_read_but_cannot_write(self):
         self.run_seed()
         demo_user = User.objects.get(username="demo-test")
+        self.assertTrue(demo_user.is_active)
+        self.assertTrue(
+            demo_user.groups.filter(name=DEMO_ACCOUNT_GROUP).exists()
+        )
         token = Token.objects.create(user=demo_user)
         self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
 
@@ -2117,3 +2129,218 @@ class DemoSeedCommandTests(APITestCase):
             ).status_code,
             status.HTTP_403_FORBIDDEN,
         )
+
+    def test_existing_non_demo_user_is_refused(self):
+        user = User.objects.create_user(
+            username="demo-test",
+            password="AncienMotDePasse!123",
+            is_staff=True,
+            is_superuser=True,
+        )
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "n'est pas reconnu comme compte de démonstration",
+        ):
+            self.run_seed()
+
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
+        self.assertFalse(Product.objects.exists())
+        self.assertFalse(Order.objects.exists())
+
+    def test_existing_non_demo_user_credentials_and_permissions_are_unchanged(
+        self,
+    ):
+        old_password = "AncienMotDePasse!123"
+        user = User.objects.create_user(
+            username="demo-test",
+            password=old_password,
+            is_staff=True,
+            is_superuser=True,
+        )
+
+        with self.assertRaises(CommandError):
+            self.run_seed()
+
+        user.refresh_from_db()
+        self.assertTrue(user.check_password(old_password))
+        self.assertTrue(user.is_staff)
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.is_active)
+        self.assertFalse(
+            user.groups.filter(name=DEMO_ACCOUNT_GROUP).exists()
+        )
+
+    def test_existing_non_demo_product_with_reserved_sku_is_not_modified(
+        self,
+    ):
+        product = Product.objects.create(
+            sku="DEMO-001",
+            name="Produit réel",
+            purchase_price="999.00",
+            selling_price="1999.00",
+            packaging_cost="99.00",
+            stock_quantity=7,
+        )
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "n'est pas reconnu comme donnée de démonstration",
+        ):
+            self.run_seed()
+
+        product.refresh_from_db()
+        self.assertEqual(product.name, "Produit réel")
+        self.assertEqual(product.purchase_price, Decimal("999.00"))
+        self.assertEqual(product.selling_price, Decimal("1999.00"))
+        self.assertEqual(product.packaging_cost, Decimal("99.00"))
+        self.assertEqual(product.stock_quantity, 7)
+        self.assertFalse(User.objects.filter(username="demo-test").exists())
+
+    def test_reserved_sku_with_unexpected_values_is_not_modified(self):
+        product = Product.objects.create(
+            sku="DEMO-001",
+            name="Sac en toile démo",
+            purchase_price="999.00",
+            selling_price="2400.00",
+            packaging_cost="150.00",
+            stock_quantity=25,
+        )
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "n'est pas reconnu comme donnée de démonstration",
+        ):
+            self.run_seed()
+
+        product.refresh_from_db()
+        self.assertEqual(product.name, "Sac en toile démo")
+        self.assertEqual(product.purchase_price, Decimal("999.00"))
+        self.assertEqual(product.selling_price, Decimal("2400.00"))
+        self.assertEqual(product.packaging_cost, Decimal("150.00"))
+        self.assertEqual(product.stock_quantity, 25)
+
+    def test_existing_non_demo_order_with_reserved_number_is_not_modified(
+        self,
+    ):
+        real_product = Product.objects.create(
+            sku="REAL-001",
+            name="Produit réel",
+            purchase_price="100.00",
+            selling_price="200.00",
+        )
+        order = Order.objects.create(
+            order_number="DEMO-1001",
+            customer_name="Vrai client",
+            product=real_product,
+            quantity=3,
+            unit_price="200.00",
+            purchase_price="100.00",
+            notes="Commande réelle",
+        )
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "n'est pas reconnue comme donnée de démonstration",
+        ):
+            self.run_seed()
+
+        order.refresh_from_db()
+        self.assertEqual(order.customer_name, "Vrai client")
+        self.assertEqual(order.quantity, 3)
+        self.assertEqual(order.unit_price, Decimal("200.00"))
+        self.assertEqual(order.notes, "Commande réelle")
+        self.assertEqual(order.product_id, real_product.pk)
+        self.assertFalse(Product.objects.filter(sku="DEMO-001").exists())
+        self.assertFalse(User.objects.filter(username="demo-test").exists())
+
+    def test_duplicate_reserved_sku_is_refused_without_overwrite(self):
+        first = Product.objects.create(
+            sku="DEMO-001",
+            name="Produit A",
+            purchase_price="10.00",
+            selling_price="20.00",
+        )
+        second = Product.objects.create(
+            sku="DEMO-001",
+            name="Produit B",
+            purchase_price="30.00",
+            selling_price="40.00",
+        )
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "Plusieurs produits portent le SKU réservé",
+        ):
+            self.run_seed()
+
+        self.assertEqual(Product.objects.filter(sku="DEMO-001").count(), 2)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.name, "Produit A")
+        self.assertEqual(second.name, "Produit B")
+        self.assertFalse(User.objects.filter(username="demo-test").exists())
+
+    def test_error_during_seed_rolls_back_earlier_creations(self):
+        real_product = Product.objects.create(
+            sku="REAL-001",
+            name="Produit réel",
+            purchase_price="100.00",
+            selling_price="200.00",
+        )
+        existing_order = Order.objects.create(
+            order_number="DEMO-1012",
+            customer_name="Vrai client",
+            product=real_product,
+            quantity=1,
+            unit_price="200.00",
+            purchase_price="100.00",
+            notes="Commande réelle",
+        )
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "n'est pas reconnue comme donnée de démonstration",
+        ):
+            self.run_seed()
+
+        self.assertFalse(User.objects.filter(username="demo-test").exists())
+        self.assertFalse(
+            Product.objects.filter(sku__startswith="DEMO-").exists()
+        )
+        self.assertEqual(
+            Order.objects.filter(
+                order_number__startswith="DEMO-"
+            ).count(),
+            1,
+        )
+        existing_order.refresh_from_db()
+        self.assertEqual(existing_order.notes, "Commande réelle")
+
+    def test_recognized_demo_user_can_be_updated(self):
+        self.run_seed()
+        new_password = secrets.token_urlsafe(16)
+
+        self.run_seed(password=new_password)
+
+        demo_user = User.objects.get(username="demo-test")
+        self.assertTrue(demo_user.check_password(new_password))
+        self.assertFalse(demo_user.check_password(self.password))
+        self.assertFalse(demo_user.is_staff)
+        self.assertFalse(demo_user.is_superuser)
+
+    def test_promoted_demo_user_is_not_demoted_automatically(self):
+        self.run_seed()
+        demo_user = User.objects.get(username="demo-test")
+        demo_user.is_staff = True
+        demo_user.save(update_fields=["is_staff"])
+
+        with self.assertRaisesMessage(
+            CommandError,
+            "Refus de le rétrograder",
+        ):
+            self.run_seed()
+
+        demo_user.refresh_from_db()
+        self.assertTrue(demo_user.is_staff)
+        self.assertTrue(demo_user.check_password(self.password))
