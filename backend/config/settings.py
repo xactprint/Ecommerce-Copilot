@@ -142,7 +142,7 @@ if DATABASE_URL:
     DATABASES = {
         "default": dj_database_url.parse(
             DATABASE_URL,
-            conn_max_age=600,
+            conn_max_age=0,
             conn_health_checks=True,
         )
     }
@@ -157,6 +157,26 @@ else:
     raise ImproperlyConfigured(
         "DATABASE_URL doit être défini lorsque DJANGO_DEBUG=false : "
         "SQLite est interdit en production."
+    )
+
+# Neon / PgBouncer : le pooler fonctionne en mode transaction. Les curseurs
+# côté serveur ne sont donc pas compatibles, et les connexions inactives
+# doivent être fermées plutôt que conservées 10 minutes.
+if DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql":
+    DATABASES["default"].update(
+        {
+            "CONN_MAX_AGE": 0,
+            "CONN_HEALTH_CHECKS": True,
+            "DISABLE_SERVER_SIDE_CURSORS": True,
+        }
+    )
+    database_options = DATABASES["default"].setdefault("OPTIONS", {})
+    if not DEBUG:
+        database_options["sslmode"] = "require"
+
+if not DEBUG and DATABASES["default"]["ENGINE"] != "django.db.backends.postgresql":
+    raise ImproperlyConfigured(
+        "DATABASE_URL doit pointer vers PostgreSQL lorsque DJANGO_DEBUG=false."
     )
 
 
@@ -222,6 +242,16 @@ if not DEBUG and not CORS_ALLOWED_ORIGINS:
 
 # Origines de confiance pour les requêtes CSRF (admin Django, session).
 CSRF_TRUSTED_ORIGINS = _env_list("DJANGO_CSRF_TRUSTED_ORIGINS", [])
+
+# Vercel expose l'URL unique du déploiement (production ou preview) dans
+# VERCEL_URL. On l'ajoute explicitement, sans autoriser tout *.vercel.app.
+VERCEL_URL = os.environ.get("VERCEL_URL")
+if VERCEL_URL:
+    if VERCEL_URL not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(VERCEL_URL)
+    preview_origin = f"https://{VERCEL_URL}"
+    if preview_origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(preview_origin)
 
 
 # Django REST Framework — configuration explicite (aucune dépendance aux défauts).
