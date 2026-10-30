@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -54,6 +55,20 @@ def _env_list(name: str, default) -> list:
     return items if items else list(default)
 
 
+def _normalize_host(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if "://" not in candidate:
+        candidate = f"//{candidate}"
+    hostname = urlsplit(candidate).hostname
+    if not hostname:
+        return None
+    return hostname.lower().rstrip(".")
+
+
 # Charge un éventuel fichier backend/.env (non suivi par Git).
 _load_dotenv_file(BASE_DIR / ".env")
 
@@ -78,9 +93,17 @@ if not SECRET_KEY:
 
 # Hôtes autorisés, séparés par des virgules.
 ALLOWED_HOSTS = _env_list("DJANGO_ALLOWED_HOSTS", [])
+
+# Vercel expose l'URL unique du déploiement (production ou preview) dans
+# VERCEL_URL. On l'ajoute explicitement, sans autoriser tout *.vercel.app.
+VERCEL_URL = _normalize_host(os.environ.get("VERCEL_URL"))
+if VERCEL_URL and VERCEL_URL not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(VERCEL_URL)
+
 if not DEBUG and not ALLOWED_HOSTS:
     raise ImproperlyConfigured(
-        "DJANGO_ALLOWED_HOSTS doit être défini lorsque DJANGO_DEBUG=false."
+        "DJANGO_ALLOWED_HOSTS ou VERCEL_URL doit être défini lorsque "
+        "DJANGO_DEBUG=false."
     )
 
 
@@ -243,12 +266,7 @@ if not DEBUG and not CORS_ALLOWED_ORIGINS:
 # Origines de confiance pour les requêtes CSRF (admin Django, session).
 CSRF_TRUSTED_ORIGINS = _env_list("DJANGO_CSRF_TRUSTED_ORIGINS", [])
 
-# Vercel expose l'URL unique du déploiement (production ou preview) dans
-# VERCEL_URL. On l'ajoute explicitement, sans autoriser tout *.vercel.app.
-VERCEL_URL = os.environ.get("VERCEL_URL")
 if VERCEL_URL:
-    if VERCEL_URL not in ALLOWED_HOSTS:
-        ALLOWED_HOSTS.append(VERCEL_URL)
     preview_origin = f"https://{VERCEL_URL}"
     if preview_origin not in CSRF_TRUSTED_ORIGINS:
         CSRF_TRUSTED_ORIGINS.append(preview_origin)
