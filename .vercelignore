@@ -1,0 +1,29 @@
+# Environnements virtuels et caches locaux
+.venv/
+backend/venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets locaux
+.env
+.env.local
+backend/.env
+frontend/.env.local
+
+# Base SQLite locale
+backend/db.sqlite3
+backend/db.sqlite3-*
+
+# Artefacts locaux
+backend/staticfiles/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Divers
+.DS_Store
+Thumbs.db
+*.log

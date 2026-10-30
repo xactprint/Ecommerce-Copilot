@@ -12,7 +12,9 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
 
@@ -53,6 +55,20 @@ def _env_list(name: str, default) -> list:
     return items if items else list(default)
 
 
+def _normalize_host(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if "://" not in candidate:
+        candidate = f"//{candidate}"
+    hostname = urlsplit(candidate).hostname
+    if not hostname:
+        return None
+    return hostname.lower().rstrip(".")
+
+
 # Charge un éventuel fichier backend/.env (non suivi par Git).
 _load_dotenv_file(BASE_DIR / ".env")
 
@@ -77,9 +93,17 @@ if not SECRET_KEY:
 
 # Hôtes autorisés, séparés par des virgules.
 ALLOWED_HOSTS = _env_list("DJANGO_ALLOWED_HOSTS", [])
+
+# Vercel expose l'URL unique du déploiement (production ou preview) dans
+# VERCEL_URL. On l'ajoute explicitement, sans autoriser tout *.vercel.app.
+VERCEL_URL = _normalize_host(os.environ.get("VERCEL_URL"))
+if VERCEL_URL and VERCEL_URL not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(VERCEL_URL)
+
 if not DEBUG and not ALLOWED_HOSTS:
     raise ImproperlyConfigured(
-        "DJANGO_ALLOWED_HOSTS doit être défini lorsque DJANGO_DEBUG=false."
+        "DJANGO_ALLOWED_HOSTS ou VERCEL_URL doit être défini lorsque "
+        "DJANGO_DEBUG=false."
     )
 
 
@@ -109,6 +133,9 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
+if not DEBUG:
+    MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
+
 ROOT_URLCONF = 'config.urls'
 
 TEMPLATES = [
@@ -132,12 +159,48 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if DATABASE_URL:
+    DATABASES = {
+        "default": dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=0,
+            conn_health_checks=True,
+        )
     }
-}
+elif DEBUG:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
+else:
+    raise ImproperlyConfigured(
+        "DATABASE_URL doit être défini lorsque DJANGO_DEBUG=false : "
+        "SQLite est interdit en production."
+    )
+
+# Neon / PgBouncer : le pooler fonctionne en mode transaction. Les curseurs
+# côté serveur ne sont donc pas compatibles, et les connexions inactives
+# doivent être fermées plutôt que conservées 10 minutes.
+if DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql":
+    DATABASES["default"].update(
+        {
+            "CONN_MAX_AGE": 0,
+            "CONN_HEALTH_CHECKS": True,
+            "DISABLE_SERVER_SIDE_CURSORS": True,
+        }
+    )
+    database_options = DATABASES["default"].setdefault("OPTIONS", {})
+    if not DEBUG:
+        database_options["sslmode"] = "require"
+
+if not DEBUG and DATABASES["default"]["ENGINE"] != "django.db.backends.postgresql":
+    raise ImproperlyConfigured(
+        "DATABASE_URL doit pointer vers PostgreSQL lorsque DJANGO_DEBUG=false."
+    )
 
 
 # Password validation
@@ -174,27 +237,38 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-
-# Email
-# https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
-
-MAILERS = {
-    'default': {
-        'BACKEND': os.environ.get(
-            'DJANGO_EMAIL_BACKEND',
-            'django.core.mail.backends.console.EmailBackend',
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": (
+            "whitenoise.storage.CompressedManifestStaticFilesStorage"
         ),
     },
 }
 
 
-# CORS — origines autorisées, séparées par des virgules.
+# CORS — origines cross-origin supplémentaires autorisées.
+# L'application est servie en same-origin (frontend, /api et /admin sur le
+# même domaine). Une liste vide est donc valide en production : aucune origine
+# cross-origin n'est autorisée, mais les requêtes same-origin ne dépendent pas
+# de CORS. Ne jamais introduire de wildcard ici.
 CORS_ALLOWED_ORIGINS = _env_list(
     "DJANGO_CORS_ALLOWED_ORIGINS",
-    ["http://localhost:5173"],
+    ["http://localhost:5173"] if DEBUG else [],
 )
+
+# Origines de confiance pour les requêtes CSRF (admin Django, session).
+CSRF_TRUSTED_ORIGINS = _env_list("DJANGO_CSRF_TRUSTED_ORIGINS", [])
+
+if VERCEL_URL:
+    preview_origin = f"https://{VERCEL_URL}"
+    if preview_origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(preview_origin)
 
 
 # Django REST Framework — configuration explicite (aucune dépendance aux défauts).
@@ -214,8 +288,11 @@ REST_FRAMEWORK = {
 # Réglages de sécurité appliqués uniquement hors développement.
 # L'environnement localhost (DEBUG=true) n'est volontairement pas contraint à HTTPS.
 if not DEBUG:
+    # Render termine TLS et transmet le protocole d'origine dans cet en-tête.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_SSL_REDIRECT = _env_bool("DJANGO_SECURE_SSL_REDIRECT", True)
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_HSTS_SECONDS = int(os.environ.get("DJANGO_SECURE_HSTS_SECONDS", "31536000"))
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
