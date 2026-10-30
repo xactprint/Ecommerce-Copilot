@@ -1,0 +1,45 @@
+name: Django Migration Plan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migration-plan:
+    name: Inspect Neon migrations
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      DJANGO_DEBUG: "false"
+      DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+      DJANGO_ALLOWED_HOSTS: localhost
+      DJANGO_SETTINGS_MODULE: config.settings
+      DATABASE_URL: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate database configuration
+        run: |
+          python -c "import os, django; django.setup(); from django.db import connection; print('Database engine:', connection.vendor); assert connection.vendor == 'postgresql', 'PostgreSQL required'; print('PostgreSQL configuration OK')"
+
+      - name: Display migration plan
+        run: |
+          python manage.py migrate --plan
