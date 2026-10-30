@@ -17,6 +17,8 @@
     { "source": "/admin/(.*)", "destination": { "service": "backend" } },
     { "source": "/static", "destination": { "service": "backend" } },
     { "source": "/static/(.*)", "destination": { "service": "backend" } },
+    { "source": "/internal", "destination": { "service": "backend" } },
+    { "source": "/internal/(.*)", "destination": { "service": "backend" } },
     { "source": "/(.*)", "destination": { "service": "frontend" } }
   ]
 }
