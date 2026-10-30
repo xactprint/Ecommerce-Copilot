@@ -252,16 +252,15 @@ STORAGES = {
 }
 
 
-# CORS — origines autorisées, séparées par des virgules.
+# CORS — origines cross-origin supplémentaires autorisées.
+# L'application est servie en same-origin (frontend, /api et /admin sur le
+# même domaine). Une liste vide est donc valide en production : aucune origine
+# cross-origin n'est autorisée, mais les requêtes same-origin ne dépendent pas
+# de CORS. Ne jamais introduire de wildcard ici.
 CORS_ALLOWED_ORIGINS = _env_list(
     "DJANGO_CORS_ALLOWED_ORIGINS",
     ["http://localhost:5173"] if DEBUG else [],
 )
-if not DEBUG and not CORS_ALLOWED_ORIGINS:
-    raise ImproperlyConfigured(
-        "DJANGO_CORS_ALLOWED_ORIGINS doit être défini lorsque "
-        "DJANGO_DEBUG=false."
-    )
 
 # Origines de confiance pour les requêtes CSRF (admin Django, session).
 CSRF_TRUSTED_ORIGINS = _env_list("DJANGO_CSRF_TRUSTED_ORIGINS", [])

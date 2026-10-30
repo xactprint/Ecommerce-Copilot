@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 
 SETTINGS_READER = """
@@ -101,6 +101,28 @@ class DeploymentSettingsTests(SimpleTestCase):
             ["https://frontend.example.com"],
         )
 
+    def test_empty_cors_is_valid_in_production(self):
+        settings = self.read_settings(
+            DJANGO_CORS_ALLOWED_ORIGINS="",
+            VERCEL_URL="preview-abc.vercel.app",
+        )
+
+        self.assertEqual(settings["cors_allowed_origins"], [])
+        self.assertNotIn("*", settings["cors_allowed_origins"])
+
+    def test_csrf_origins_are_independent_from_empty_cors(self):
+        settings = self.read_settings(
+            DJANGO_CORS_ALLOWED_ORIGINS="",
+            DJANGO_CSRF_TRUSTED_ORIGINS="https://admin.example.com",
+            VERCEL_URL="preview-abc.vercel.app",
+        )
+
+        self.assertEqual(settings["cors_allowed_origins"], [])
+        self.assertEqual(
+            settings["csrf_trusted_origins"],
+            ["https://admin.example.com", "https://preview-abc.vercel.app"],
+        )
+
     def test_sqlite_is_refused_when_debug_is_false(self):
         result = self.run_settings(
             VERCEL_URL="preview-abc.vercel.app",
@@ -109,3 +131,47 @@ class DeploymentSettingsTests(SimpleTestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PostgreSQL", result.stderr)
+
+
+class CorsResponseTests(TestCase):
+    def test_same_origin_request_is_not_blocked_by_empty_cors(self):
+        with self.settings(
+            ALLOWED_HOSTS=["testserver"],
+            CORS_ALLOWED_ORIGINS=[],
+        ):
+            response = self.client.get(
+                "/api/products/",
+                HTTP_ORIGIN="http://testserver",
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("Access-Control-Allow-Origin", response)
+
+    def test_disallowed_origin_receives_no_cors_header(self):
+        with self.settings(
+            ALLOWED_HOSTS=["testserver"],
+            CORS_ALLOWED_ORIGINS=[],
+        ):
+            response = self.client.get(
+                "/api/products/",
+                HTTP_ORIGIN="https://evil.example.com",
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("Access-Control-Allow-Origin", response)
+
+    def test_explicit_origin_receives_cors_header(self):
+        with self.settings(
+            ALLOWED_HOSTS=["testserver"],
+            CORS_ALLOWED_ORIGINS=["https://frontend.example.com"],
+        ):
+            response = self.client.get(
+                "/api/products/",
+                HTTP_ORIGIN="https://frontend.example.com",
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response["Access-Control-Allow-Origin"],
+            "https://frontend.example.com",
+        )
