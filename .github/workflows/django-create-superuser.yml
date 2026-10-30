@@ -1,0 +1,98 @@
+name: Django Create Neon Superuser
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-superuser:
+    name: Create Neon production administrator
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: localhost
+      DJANGO_SETTINGS_MODULE: config.settings
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate database and create superuser
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+          NEON_ADMIN_USERNAME: ${{ secrets.NEON_ADMIN_USERNAME }}
+          NEON_ADMIN_EMAIL: ${{ secrets.NEON_ADMIN_EMAIL }}
+          NEON_ADMIN_PASSWORD: ${{ secrets.NEON_ADMIN_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          import django
+
+          django.setup()
+
+          from django.db import connection, transaction
+          from django.contrib.auth import get_user_model
+
+          username = os.environ["NEON_ADMIN_USERNAME"]
+          email = os.environ["NEON_ADMIN_EMAIL"]
+          password = os.environ["NEON_ADMIN_PASSWORD"]
+
+          if not username or not email or not password:
+              raise RuntimeError(
+                  "Administrator environment variables are missing."
+              )
+
+          # Validate the target database before making any changes.
+          with connection.cursor() as cursor:
+              cursor.execute("SELECT current_database(), current_user")
+              database, db_user = cursor.fetchone()
+
+          print("Database:", database)
+          print("Database user:", db_user)
+
+          assert connection.vendor == "postgresql", "PostgreSQL required"
+          assert database == "ecommerce-copilot", "Unexpected database"
+          assert db_user == "ecommerce-copilot_owner", "Unexpected database user"
+
+          User = get_user_model()
+
+          # Do not overwrite an existing account.
+          with transaction.atomic():
+              if User.objects.filter(username=username).exists():
+                  raise RuntimeError(
+                      "This username already exists. No account was changed."
+                  )
+
+              if User.objects.filter(email=email).exists():
+                  raise RuntimeError(
+                      "This email already exists. No account was changed."
+                  )
+
+              User.objects.create_superuser(
+                  username=username,
+                  email=email,
+                  password=password,
+              )
+
+          print("Neon superuser created successfully.")
+          print("Username:", username)
+          print("Administrator privileges: enabled")
+          PY
