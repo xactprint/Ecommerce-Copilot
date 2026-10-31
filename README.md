@@ -1,6 +1,6 @@
 ## For Testing : 
 
-user : admin | password : admin123456
+user : demo | password : Ab123456
 
 
 # Ecommerce Copilot
