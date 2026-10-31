@@ -1,0 +1,113 @@
+name: Django Seed Demo Data
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seed-demo:
+    name: Seed demo data into Neon production
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: localhost
+      DJANGO_SETTINGS_MODULE: config.settings
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        env:
+          CHECK_DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          CHECK_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+          CHECK_DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+        run: |
+          missing=0
+          for name in CHECK_DJANGO_SECRET_KEY CHECK_DATABASE_URL CHECK_DEMO_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Required secret $name is not set."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Aborting: one or more required secrets are missing."
+            exit 1
+          fi
+          echo "Required secrets are present."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate production database
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+        run: |
+          python - <<'PY'
+          import django
+
+          django.setup()
+
+          from django.db import connection
+
+          if connection.vendor != "postgresql":
+              raise SystemExit(
+                  f"Aborting: PostgreSQL required, got '{connection.vendor}'."
+              )
+
+          with connection.cursor() as cursor:
+              cursor.execute("SELECT current_database(), current_user")
+              database, db_user = cursor.fetchone()
+
+          print("Database:", database)
+          print("Database user:", db_user)
+
+          if database != "ecommerce-copilot":
+              raise SystemExit("Aborting: unexpected database name.")
+          if db_user != "ecommerce-copilot_owner":
+              raise SystemExit("Aborting: unexpected database user.")
+
+          print("Production database validation successful.")
+          PY
+
+      - name: Seed demo data
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+          DEMO_USERNAME: ${{ secrets.DEMO_USERNAME || 'demo' }}
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+        run: python manage.py seed_demo --confirm
+
+      - name: Verify demo data
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DATABASE_URL: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+        run: |
+          python - <<'PY'
+          import django
+
+          django.setup()
+
+          from api.models import Product
+
+          total = Product.objects.count()
+          demo = Product.objects.filter(sku__startswith="DEMO-").count()
+
+          print("Total products:", total)
+          print("Demo products (SKU prefix DEMO-):", demo)
+          PY
