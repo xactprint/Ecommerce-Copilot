@@ -1,5 +1,6 @@
 import os
 import secrets
+from collections import Counter
 from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
@@ -9,7 +10,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.authtoken.models import Token
@@ -17,7 +18,9 @@ from rest_framework.test import APITestCase
 
 from .management.commands.seed_demo import (
     DEMO_ACCOUNT_GROUP,
+    DEMO_PRODUCTS,
     SYNTHETIC_NOTE,
+    stock_state,
 )
 from .models import Order, Product
 
@@ -2047,8 +2050,11 @@ class DemoSeedCommandTests(APITestCase):
         super().setUp()
         self.password = secrets.token_urlsafe(16)
 
-    def run_seed(self, password=None):
+    def run_seed(self, password=None, confirm=True):
         output = StringIO()
+        args = ["seed_demo"]
+        if confirm:
+            args.append("--confirm")
         with patch.dict(
             os.environ,
             {
@@ -2057,7 +2063,7 @@ class DemoSeedCommandTests(APITestCase):
             },
             clear=False,
         ):
-            call_command("seed_demo", stdout=output)
+            call_command(*args, stdout=output)
         return output.getvalue()
 
     def test_seed_creates_synthetic_data_without_personal_information(self):
@@ -2069,12 +2075,77 @@ class DemoSeedCommandTests(APITestCase):
         self.assertFalse(demo_user.is_superuser)
         self.assertNotIn(self.password, output)
 
-        self.assertEqual(Product.objects.count(), 3)
+        self.assertEqual(Product.objects.count(), len(DEMO_PRODUCTS))
         self.assertEqual(Order.objects.count(), 12)
+        self.assertEqual(
+            set(Product.objects.values_list("sku", flat=True)),
+            {spec["sku"] for spec in DEMO_PRODUCTS},
+        )
+        self.assertGreaterEqual(
+            len({spec["category"] for spec in DEMO_PRODUCTS}),
+            6,
+        )
         self.assertFalse(Order.objects.exclude(customer_phone="").exists())
         self.assertFalse(
             Order.objects.exclude(notes=SYNTHETIC_NOTE).exists()
         )
+
+    def test_seed_covers_multiple_inventory_states(self):
+        self.run_seed()
+
+        states = Counter(
+            stock_state(quantity)
+            for quantity in Product.objects.values_list(
+                "stock_quantity", flat=True
+            )
+        )
+
+        self.assertEqual(states["out_of_stock"], 2)
+        self.assertEqual(states["very_low"], 3)
+        self.assertEqual(states["low"], 6)
+        self.assertEqual(states["healthy"], 5)
+        self.assertGreaterEqual(states["medium"], 5)
+        self.assertEqual(sum(states.values()), len(DEMO_PRODUCTS))
+
+    @override_settings(DEBUG=False)
+    def test_seed_requires_confirm_outside_debug(self):
+        output = StringIO()
+        with patch.dict(
+            os.environ,
+            {
+                "DEMO_USERNAME": "demo-test",
+                "DEMO_PASSWORD": self.password,
+            },
+            clear=False,
+        ):
+            with self.assertRaisesMessage(
+                CommandError,
+                "Exécution refusée",
+            ):
+                call_command("seed_demo", stdout=output)
+
+        self.assertFalse(Product.objects.exists())
+        self.assertFalse(User.objects.filter(username="demo-test").exists())
+
+    def test_seed_preserves_existing_non_demo_products(self):
+        real_product = Product.objects.create(
+            sku="REAL-STORE-001",
+            name="Produit réel",
+            purchase_price="999.00",
+            selling_price="1999.00",
+            packaging_cost="99.00",
+            stock_quantity=7,
+        )
+
+        self.run_seed()
+
+        real_product.refresh_from_db()
+        self.assertEqual(real_product.name, "Produit réel")
+        self.assertEqual(real_product.purchase_price, Decimal("999.00"))
+        self.assertEqual(real_product.selling_price, Decimal("1999.00"))
+        self.assertEqual(real_product.packaging_cost, Decimal("99.00"))
+        self.assertEqual(real_product.stock_quantity, 7)
+        self.assertEqual(Product.objects.count(), len(DEMO_PRODUCTS) + 1)
 
     def test_seed_is_idempotent(self):
         self.run_seed()
@@ -2114,9 +2185,12 @@ class DemoSeedCommandTests(APITestCase):
             self.client.get(reverse("dashboard")).status_code,
             status.HTTP_200_OK,
         )
+        products_response = self.client.get(reverse("product-list"))
+        self.assertEqual(products_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(products_response.data["count"], len(DEMO_PRODUCTS))
         self.assertEqual(
-            self.client.get(reverse("product-list")).status_code,
-            status.HTTP_200_OK,
+            {item["sku"] for item in products_response.data["results"]},
+            {spec["sku"] for spec in DEMO_PRODUCTS},
         )
         self.assertEqual(
             self.client.post(

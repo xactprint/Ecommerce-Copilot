@@ -1,7 +1,9 @@
 import os
+from collections import Counter
 from datetime import timedelta
 from decimal import Decimal
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.management.base import BaseCommand, CommandError
@@ -17,6 +19,7 @@ SYNTHETIC_NOTE = "Donnée synthétique de démonstration."
 DEMO_PRODUCTS = (
     {
         "sku": "DEMO-001",
+        "category": "Fashion",
         "name": "Sac en toile démo",
         "purchase_price": "1200.00",
         "selling_price": "2400.00",
@@ -25,6 +28,7 @@ DEMO_PRODUCTS = (
     },
     {
         "sku": "DEMO-002",
+        "category": "Home & Kitchen",
         "name": "Lampe de bureau démo",
         "purchase_price": "1800.00",
         "selling_price": "3300.00",
@@ -33,11 +37,210 @@ DEMO_PRODUCTS = (
     },
     {
         "sku": "DEMO-003",
+        "category": "Office & Productivity",
         "name": "Carnet de notes démo",
         "purchase_price": "450.00",
         "selling_price": "1100.00",
         "packaging_cost": "80.00",
         "stock_quantity": 40,
+    },
+    {
+        "sku": "DEMO-ELEC-001",
+        "category": "Electronics",
+        "name": "Wireless Bluetooth Headphones",
+        "purchase_price": "12500.00",
+        "selling_price": "18900.00",
+        "packaging_cost": "350.00",
+        "stock_quantity": 120,
+    },
+    {
+        "sku": "DEMO-ELEC-002",
+        "category": "Electronics",
+        "name": "Smart Watch",
+        "purchase_price": "19500.00",
+        "selling_price": "28900.00",
+        "packaging_cost": "400.00",
+        "stock_quantity": 64,
+    },
+    {
+        "sku": "DEMO-ELEC-003",
+        "category": "Electronics",
+        "name": "Portable Bluetooth Speaker",
+        "purchase_price": "6800.00",
+        "selling_price": "9900.00",
+        "packaging_cost": "300.00",
+        "stock_quantity": 8,
+    },
+    {
+        "sku": "DEMO-ELEC-004",
+        "category": "Electronics",
+        "name": "USB-C Fast Charger",
+        "purchase_price": "750.00",
+        "selling_price": "1500.00",
+        "packaging_cost": "100.00",
+        "stock_quantity": 3,
+    },
+    {
+        "sku": "DEMO-ELEC-005",
+        "category": "Electronics",
+        "name": "Wireless Mouse",
+        "purchase_price": "1400.00",
+        "selling_price": "2400.00",
+        "packaging_cost": "120.00",
+        "stock_quantity": 0,
+    },
+    {
+        "sku": "DEMO-FASH-001",
+        "category": "Fashion",
+        "name": "Classic Cotton T-Shirt",
+        "purchase_price": "900.00",
+        "selling_price": "1800.00",
+        "packaging_cost": "80.00",
+        "stock_quantity": 95,
+    },
+    {
+        "sku": "DEMO-FASH-002",
+        "category": "Fashion",
+        "name": "Urban Hoodie",
+        "purchase_price": "2600.00",
+        "selling_price": "4500.00",
+        "packaging_cost": "150.00",
+        "stock_quantity": 12,
+    },
+    {
+        "sku": "DEMO-FASH-003",
+        "category": "Fashion",
+        "name": "Running Sneakers",
+        "purchase_price": "5200.00",
+        "selling_price": "8500.00",
+        "packaging_cost": "250.00",
+        "stock_quantity": 2,
+    },
+    {
+        "sku": "DEMO-HOME-001",
+        "category": "Home & Kitchen",
+        "name": "Stainless Steel Coffee Maker",
+        "purchase_price": "7800.00",
+        "selling_price": "12500.00",
+        "packaging_cost": "450.00",
+        "stock_quantity": 30,
+    },
+    {
+        "sku": "DEMO-HOME-002",
+        "category": "Home & Kitchen",
+        "name": "Electric Kettle",
+        "purchase_price": "2400.00",
+        "selling_price": "4200.00",
+        "packaging_cost": "200.00",
+        "stock_quantity": 14,
+    },
+    {
+        "sku": "DEMO-HOME-003",
+        "category": "Home & Kitchen",
+        "name": "Kitchen Storage Set",
+        "purchase_price": "1500.00",
+        "selling_price": "2900.00",
+        "packaging_cost": "180.00",
+        "stock_quantity": 6,
+    },
+    {
+        "sku": "DEMO-BEAUTY-001",
+        "category": "Beauty & Personal Care",
+        "name": "Facial Cleansing Brush",
+        "purchase_price": "2100.00",
+        "selling_price": "3800.00",
+        "packaging_cost": "120.00",
+        "stock_quantity": 42,
+    },
+    {
+        "sku": "DEMO-BEAUTY-002",
+        "category": "Beauty & Personal Care",
+        "name": "Hair Dryer",
+        "purchase_price": "3600.00",
+        "selling_price": "6200.00",
+        "packaging_cost": "250.00",
+        "stock_quantity": 9,
+    },
+    {
+        "sku": "DEMO-BEAUTY-003",
+        "category": "Beauty & Personal Care",
+        "name": "Moisturizing Skin Cream",
+        "purchase_price": "600.00",
+        "selling_price": "1200.00",
+        "packaging_cost": "60.00",
+        "stock_quantity": 150,
+    },
+    {
+        "sku": "DEMO-BEAUTY-004",
+        "category": "Beauty & Personal Care",
+        "name": "Electric Grooming Kit",
+        "purchase_price": "4800.00",
+        "selling_price": "7900.00",
+        "packaging_cost": "300.00",
+        "stock_quantity": 0,
+    },
+    {
+        "sku": "DEMO-SPORT-001",
+        "category": "Sports & Fitness",
+        "name": "Yoga Mat",
+        "purchase_price": "1800.00",
+        "selling_price": "3200.00",
+        "packaging_cost": "150.00",
+        "stock_quantity": 55,
+    },
+    {
+        "sku": "DEMO-SPORT-002",
+        "category": "Sports & Fitness",
+        "name": "Resistance Bands Set",
+        "purchase_price": "800.00",
+        "selling_price": "1600.00",
+        "packaging_cost": "70.00",
+        "stock_quantity": 22,
+    },
+    {
+        "sku": "DEMO-SPORT-003",
+        "category": "Sports & Fitness",
+        "name": "Insulated Sports Bottle",
+        "purchase_price": "1200.00",
+        "selling_price": "2200.00",
+        "packaging_cost": "100.00",
+        "stock_quantity": 4,
+    },
+    {
+        "sku": "DEMO-SPORT-004",
+        "category": "Sports & Fitness",
+        "name": "Adjustable Dumbbells",
+        "purchase_price": "15000.00",
+        "selling_price": "22500.00",
+        "packaging_cost": "800.00",
+        "stock_quantity": 24,
+    },
+    {
+        "sku": "DEMO-OFFICE-001",
+        "category": "Office & Productivity",
+        "name": "Ergonomic Office Chair",
+        "purchase_price": "32000.00",
+        "selling_price": "45000.00",
+        "packaging_cost": "1200.00",
+        "stock_quantity": 28,
+    },
+    {
+        "sku": "DEMO-OFFICE-002",
+        "category": "Office & Productivity",
+        "name": "Mechanical Keyboard",
+        "purchase_price": "6500.00",
+        "selling_price": "10500.00",
+        "packaging_cost": "300.00",
+        "stock_quantity": 26,
+    },
+    {
+        "sku": "DEMO-OFFICE-003",
+        "category": "Office & Productivity",
+        "name": "Laptop Stand",
+        "purchase_price": "2200.00",
+        "selling_price": "3900.00",
+        "packaging_cost": "180.00",
+        "stock_quantity": 35,
     },
 )
 
@@ -164,15 +367,37 @@ DEMO_ORDERS = (
     },
 )
 
+PRODUCT_FIELDS = (
+    "name",
+    "purchase_price",
+    "selling_price",
+    "packaging_cost",
+    "stock_quantity",
+)
+
+STOCK_STATE_LABELS = {
+    "out_of_stock": "rupture",
+    "very_low": "très faible",
+    "low": "faible",
+    "medium": "moyen",
+    "healthy": "sain",
+}
+
+
+def stock_state(quantity):
+    if quantity == 0:
+        return "out_of_stock"
+    if quantity <= 4:
+        return "very_low"
+    if quantity <= 19:
+        return "low"
+    if quantity <= 49:
+        return "medium"
+    return "healthy"
+
 
 def _product_defaults(spec):
-    return {
-        "name": spec["name"],
-        "purchase_price": spec["purchase_price"],
-        "selling_price": spec["selling_price"],
-        "packaging_cost": spec["packaging_cost"],
-        "stock_quantity": spec["stock_quantity"],
-    }
+    return {field: spec[field] for field in PRODUCT_FIELDS}
 
 
 def _order_defaults(spec, product):
@@ -218,7 +443,30 @@ class Command(BaseCommand):
         "reconnues."
     )
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--confirm",
+            action="store_true",
+            help=(
+                "Confirme explicitement l'écriture des données de "
+                "démonstration. Obligatoire lorsque DEBUG=False."
+            ),
+        )
+
     def handle(self, *args, **options):
+        if not settings.DEBUG and not options["confirm"]:
+            raise CommandError(
+                "Exécution refusée : l'environnement n'est pas en mode DEBUG. "
+                "Relancez avec --confirm pour créer ou mettre à jour les "
+                "données de démonstration."
+            )
+
+        skus = [spec["sku"] for spec in DEMO_PRODUCTS]
+        if len(skus) != len(set(skus)):
+            raise CommandError(
+                "Le jeu de données de démonstration contient des SKU en double."
+            )
+
         username = os.environ.get("DEMO_USERNAME", "demo").strip()
         password = os.environ.get("DEMO_PASSWORD")
 
@@ -346,10 +594,30 @@ class Command(BaseCommand):
                         created_at=now - timedelta(days=spec["days_ago"])
                     )
 
+        categories = Counter(spec["category"] for spec in DEMO_PRODUCTS)
+        stock_states = Counter(
+            stock_state(spec["stock_quantity"]) for spec in DEMO_PRODUCTS
+        )
+
         self.stdout.write(
             self.style.SUCCESS(
                 "Données de démonstration prêtes pour "
                 f"'{username}' : {len(DEMO_PRODUCTS)} produits, "
                 f"{len(DEMO_ORDERS)} commandes."
+            )
+        )
+        self.stdout.write(
+            "Catégories : "
+            + ", ".join(
+                f"{category} ({count})"
+                for category, count in sorted(categories.items())
+            )
+        )
+        self.stdout.write(
+            "Stock : "
+            + ", ".join(
+                f"{STOCK_STATE_LABELS[state]} ({stock_states[state]})"
+                for state in STOCK_STATE_LABELS
+                if stock_states[state]
             )
         )
